@@ -468,6 +468,7 @@ function Export-SqlDatabaseToBacpac {
             "/p:VerifyExtraction=false",
             "/p:Storage=Memory",
             "/p:CommandTimeout=0"
+             
         )
         
         Write-LogMessage -LogFile $LogFile -Message "SqlPackage arguments: $($exportArgs -join ' ')" -Type Info
@@ -693,12 +694,14 @@ function Import-BacpacToSqlDatabase {
             "/tdn:$DatabaseName"
             "/tu:$Username"
             "/tp:$Password"
-            "/p:CommandTimeout=0"
+            "/p:CommandTimeout=3600"
         )
 
         # Add Managed Instance specific parameters
         if ($IsManagedInstance) {
-            $importArgs += "/p:Storage=File"  # Use File for large imports on MI
+            # $importArgs += "/p:Storage=Memory"  # Changed from File to Memory
+            # $importArgs += "/p:AllowIncompatiblePlatform=True"
+            # $importArgs += "/p:CommandTimeout=3600"
 
             $message = "Target server: '$ServerFQDN' is Managed Instance!"
             Write-StatusMessage $message -Type Action -Indent 3
