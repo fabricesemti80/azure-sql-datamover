@@ -1,0 +1,6 @@
+Operation_ID,SRC_server,SRC_SQL_Admin,SRC_SQL_Password,DST_server,DST_SQL_Admin,DST_SQL_Password,Database_Name,Local_Backup_File_Path,Storage_Account,Storage_Container,Storage_Access_Key,Export_Action,Import_Action
+001,sql-paas-datamart01-emp-dev-ne,sqladmin,,sql-paas-datamart01-emp-dev-ne,sqladmin,,WideWorldImporters,C:\temp\backups\WideWorldImporters.bacpac,sttransfers00allprodne,stct-transfers-00-all-prod-ne,,True,True
+002,sql-server-source.database.windows.net,dbadmin,,sqlmi-target.1a2b3c4d5e6f.database.windows.net,dbadmin,,Northwind,C:\temp\backups\Northwind.bacpac,mystorageaccount,backups-container,,False,True
+003,on-prem-sql-server,sa,,sql-paas-target.database.windows.net,sqladmin,,AdventureWorks,C:\backups\AdventureWorks.bacpac,prodstorageacct,database-backups,,True,False
+004,sql-dev-server.database.windows.net,devadmin,,sql-prod-server.database.windows.net,prodadmin,,CustomerDB,D:\exports\CustomerDB.bacpac,backupstorage,prod-backups,,True,True
+005,legacy-sql.database.windows.net,legacyuser,,modern-sql.database.windows.net,modernuser,,InventoryDB,C:\migrations\InventoryDB.bacpac,migrationstore,legacy-to-modern,,False,True

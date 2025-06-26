@@ -49,15 +49,26 @@ Process {
         Write-LogMessage -LogFile $logFile -Message "Database Name: $databaseName" -Type Info
         Write-LogMessage -LogFile $logFile -Message "Start Time: $($operationStartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Type Info
 
+      # In the Process block, after parsing the boolean flags, add:
+
         # Parse boolean flags
         $exportAction = [bool]::Parse($row.Export_Action)
         $importAction = [bool]::Parse($row.Import_Action)
+        
+        # Parse Remove_Tempfile flag (default to true if not specified)
+        $removeTempFile = $true
+        if ($row.PSObject.Properties.Name -contains 'Remove_Tempfile') {
+            $removeTempFile = [bool]::Parse($row.Remove_Tempfile)
+        }
 
         Write-StatusMessage "Export Action: $exportAction" -Type Info -Indent 1
         Write-StatusMessage "Import Action: $importAction" -Type Info -Indent 1
+        Write-StatusMessage "Remove Temp File: $removeTempFile" -Type Info -Indent 1
         
         Write-LogMessage -LogFile $logFile -Message "Export Action: $exportAction" -Type Info
         Write-LogMessage -LogFile $logFile -Message "Import Action: $importAction" -Type Info
+        Write-LogMessage -LogFile $logFile -Message "Remove Temp File: $removeTempFile" -Type Info
+
 
         # Skip if both actions are false
         if (-not $exportAction -and -not $importAction) {
