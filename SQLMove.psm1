@@ -156,39 +156,6 @@ function Get-ServerFQDN {
     return "$ServerName.database.windows.net"
 }
 
-function Test-IsManagedInstance {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ServerFQDN
-    )
-    
-    # Managed Instance typically has this pattern: name.random-guid.database.windows.net
-    # While regular Azure SQL is: name.database.windows.net
-    
-    # Check if the server name contains a GUID segment (typical for MI)
-    $segments = $ServerFQDN -split '\.'
-    
-    # If we have more than 3 segments and the second segment looks like a GUID part
-    # (MI format: name.guid.database.windows.net)
-    if ($segments.Count -gt 3) {
-        # Check if the second segment has a pattern that resembles a GUID part
-        # (typically contains numbers and letters in a random-looking pattern)
-        $guidSegment = $segments[1]
-        
-        # Simple heuristic: MI guid segments are typically longer than 8 chars
-        # and contain both letters and numbers
-        if ($guidSegment.Length -gt 8 -and 
-            $guidSegment -match '[a-z]' -and 
-            $guidSegment -match '[0-9]') {
-            return $true
-        }
-    }
-    
-    return $false
-}
-
-
 function Test-Prerequisites {
     [CmdletBinding()]
     param(
@@ -349,8 +316,8 @@ function Test-SqlServerAccess {
         Write-StatusMessage $message -Type Info -Indent 2
         Write-LogMessage -LogFile $LogFile -Message $message -Type Info
         
-        # Use longer timeout for Managed Instance
-        $timeout = if ($ServerFQDN -like "*.*.database.windows.net") { 60 } else { 30 }
+        # Use longer timeout for complex connections
+        $timeout = 60
         $connectionString = "Server=$ServerFQDN;Database=master;User Id=$Username;Password=$Password;Connection Timeout=$timeout;Encrypt=True;TrustServerCertificate=False;"
         
         try {
@@ -567,13 +534,11 @@ function Import-DatabaseOperation {
         
         $dstServerFQDN = Get-ServerFQDN -ServerName $Row.DST_server
         $localBackupPath = $Row.Local_Backup_File_Path
-        
-        # Detect if the destination server is a Managed Instance
-        $isManagedInstance = Test-IsManagedInstance -ServerFQDN $dstServerFQDN
-        if ($isManagedInstance) {
-            Write-StatusMessage "Detected Managed Instance: $dstServerFQDN" -Type Info -Indent 2
-            Write-LogMessage -LogFile $LogFile -Message "Detected Managed Instance: $dstServerFQDN" -Type Info
-        }
+
+        # Get the deployment type - default to AzurePaaS if not specified
+        $deploymentType = if ([string]::IsNullOrEmpty($Row.Type)) { "AzurePaaS" } else { $Row.Type }
+        Write-StatusMessage "Deployment Type: $deploymentType" -Type Info -Indent 2
+        Write-LogMessage -LogFile $LogFile -Message "Deployment Type: $deploymentType" -Type Info
         
         # Step 1: Download BACPAC file from storage (if not already local)
         if (-not (Test-Path $localBackupPath)) {
@@ -613,26 +578,72 @@ function Import-DatabaseOperation {
             Write-LogMessage -LogFile $LogFile -Message $message -Type Info
         }
         
-        # Step 2: Import BACPAC file to destination database
+        # Step 2: Import BACPAC file to destination database based on deployment type
         Write-StatusMessage "Importing BACPAC file to destination database..." -Type Action -Indent 2
         Write-LogMessage -LogFile $LogFile -Message "Starting BACPAC import to destination database" -Type Action
         
-        $importParams = @{
-            BacpacSource = $localBackupPath
-            ServerFQDN = $dstServerFQDN
-            DatabaseName = $Row.Database_Name
-            Username = $Row.DST_SQL_Admin
-            Password = $Row.DST_SQL_Password
-            SqlPackagePath = $SqlPackagePath
-            LogFile = $LogFile
+        $importSuccess = $false
+
+        switch ($deploymentType) {
+            "AzurePaaS" {
+                Write-StatusMessage "Using Azure SQL Database (PaaS) import method" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Database (PaaS) import method" -Type Info
+                
+                $importParams = @{
+                    BacpacSource = $localBackupPath
+                    ServerFQDN = $dstServerFQDN
+                    DatabaseName = $Row.Database_Name
+                    Username = $Row.DST_SQL_Admin
+                    Password = $Row.DST_SQL_Password
+                    SqlPackagePath = $SqlPackagePath
+                    LogFile = $LogFile
+                }
+                
+                $importSuccess = Import-BacpacToSqlDatabase @importParams
+            }
+            
+            "AzureMI" {
+                Write-StatusMessage "Using Azure SQL Managed Instance import method" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Managed Instance import method" -Type Info
+                
+                # Call future function for MI import
+                Write-StatusMessage "Azure SQL Managed Instance import not yet implemented" -Type Warning -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Azure SQL Managed Instance import not yet implemented" -Type Warning
+                
+                # TODO: Call Import-BacpacToSqlManagedInstance when implemented
+                $importSuccess = $false
+            }
+            
+            "AzureIaaS" {
+                Write-StatusMessage "Using Azure SQL IaaS VM import method" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL IaaS VM import method" -Type Info
+                
+                # Call future function for IaaS import
+                Write-StatusMessage "Azure SQL IaaS VM import not yet implemented" -Type Warning -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Azure SQL IaaS VM import not yet implemented" -Type Warning
+                
+                # TODO: Call Import-BacpacToSqlIaaS when implemented
+                $importSuccess = $false
+            }
+            
+            default {
+                # Default to AzurePaaS method for backward compatibility
+                Write-StatusMessage "Unknown deployment type. Using default Azure SQL Database (PaaS) import method" -Type Warning -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Unknown deployment type. Using default Azure SQL Database (PaaS) import method" -Type Warning
+                
+                $importParams = @{
+                    BacpacSource = $localBackupPath
+                    ServerFQDN = $dstServerFQDN
+                    DatabaseName = $Row.Database_Name
+                    Username = $Row.DST_SQL_Admin
+                    Password = $Row.DST_SQL_Password
+                    SqlPackagePath = $SqlPackagePath
+                    LogFile = $LogFile
+                }
+                
+                $importSuccess = Import-BacpacToSqlDatabase @importParams
+            }
         }
-        
-        # Add IsManagedInstance switch if detected
-        if ($isManagedInstance) {
-            $importParams.Add('IsManagedInstance', $true)
-        }
-        
-        $importSuccess = Import-BacpacToSqlDatabase @importParams
         
         if (-not $importSuccess) {
             $errorMessage = "Failed to import BACPAC file to destination database"
@@ -654,8 +665,6 @@ function Import-DatabaseOperation {
     }
 }
 
-
-
 function Import-BacpacToSqlDatabase {
     [CmdletBinding()]
     param(
@@ -665,8 +674,7 @@ function Import-BacpacToSqlDatabase {
         [string]$Username,
         [string]$Password,
         [string]$SqlPackagePath,
-        [string]$LogFile,
-        [switch]$IsManagedInstance
+        [string]$LogFile
     )
 
     try {
@@ -696,17 +704,6 @@ function Import-BacpacToSqlDatabase {
             "/tp:$Password"
             "/p:CommandTimeout=3600"
         )
-
-        # Add Managed Instance specific parameters
-        if ($IsManagedInstance) {
-            # $importArgs += "/p:Storage=Memory"  # Changed from File to Memory
-            # $importArgs += "/p:AllowIncompatiblePlatform=True"
-            # $importArgs += "/p:CommandTimeout=3600"
-
-            $message = "Target server: '$ServerFQDN' is Managed Instance!"
-            Write-StatusMessage $message -Type Action -Indent 3
-            Write-LogMessage -LogFile $LogFile -Message $message -Type Action
-        }
 
         Write-LogMessage -LogFile $LogFile -Message "SqlPackage import arguments: $($importArgs -join ' ')" -Type Info
 
@@ -802,6 +799,45 @@ function Import-BacpacToSqlDatabase {
     }
 }
 
+# Placeholder for future Managed Instance import method
+function Import-BacpacToSqlManagedInstance {
+    [CmdletBinding()]
+    param(
+        [string]$BacpacSource,
+        [string]$ServerFQDN,
+        [string]$DatabaseName,
+        [string]$Username,
+        [string]$Password,
+        [string]$SqlPackagePath,
+        [string]$LogFile
+    )
+    
+    Write-StatusMessage "Azure SQL Managed Instance import not yet implemented" -Type Warning -Indent 3
+    Write-LogMessage -LogFile $LogFile -Message "Azure SQL Managed Instance import not yet implemented" -Type Warning
+    
+    # TODO: Implement MI-specific import logic
+    return $false
+}
+
+# Placeholder for future IaaS import method
+function Import-BacpacToSqlIaaS {
+    [CmdletBinding()]
+    param(
+        [string]$BacpacSource,
+        [string]$ServerFQDN,
+        [string]$DatabaseName,
+        [string]$Username,
+        [string]$Password,
+        [string]$SqlPackagePath,
+        [string]$LogFile
+    )
+    
+    Write-StatusMessage "Azure SQL IaaS VM import not yet implemented" -Type Warning -Indent 3
+    Write-LogMessage -LogFile $LogFile -Message "Azure SQL IaaS VM import not yet implemented" -Type Warning
+    
+    # TODO: Implement IaaS-specific import logic
+    return $false
+}
 
 function Upload-BacpacToStorage {
     [CmdletBinding()]
@@ -917,7 +953,7 @@ function Find-LatestBacpacBlob {
         [string]$StorageKey,
         [string]$DatabaseName,
         [string]$LogFile,
-        [string]$OperationId = $null  # Add this parameter
+        [string]$OperationId = $null
     )
     
     try {
@@ -986,8 +1022,6 @@ function Find-LatestBacpacBlob {
         return $null
     }
 }
-
-
 function Export-DatabaseOperation {
     [CmdletBinding()]
     param(
@@ -1005,6 +1039,11 @@ function Export-DatabaseOperation {
         Write-LogMessage -LogFile $LogFile -Message "Starting export database operation" -Type Action
         
         $srcServerFQDN = Get-ServerFQDN -ServerName $Row.SRC_server
+
+        # Get the deployment type - default to AzurePaaS if not specified
+        $deploymentType = if ([string]::IsNullOrEmpty($Row.Type)) { "AzurePaaS" } else { $Row.Type }
+        Write-StatusMessage "Deployment Type: $deploymentType" -Type Info -Indent 2
+        Write-LogMessage -LogFile $LogFile -Message "Deployment Type: $deploymentType" -Type Info
         
         # Modify the local backup path to include Operation ID at the front
         $originalPath = $Row.Local_Backup_File_Path
@@ -1037,17 +1076,62 @@ function Export-DatabaseOperation {
         # Log the modified path
         Write-LogMessage -LogFile $LogFile -Message "Modified local backup path: $localBackupPath" -Type Info
         
-        # Step 1: Export database to local BACPAC file
+        # Step 1: Export database to local BACPAC file based on deployment type
         Write-StatusMessage "Exporting database to local BACPAC file..." -Type Action -Indent 2
         Write-LogMessage -LogFile $LogFile -Message "Starting BACPAC export to local file: $localBackupPath" -Type Action
         
-        $exportSuccess = Export-SqlDatabaseToBacpac -ServerFQDN $srcServerFQDN `
-            -DatabaseName $Row.Database_Name `
-            -Username $Row.SRC_SQL_Admin `
-            -Password $Row.SRC_SQL_Password `
-            -OutputPath $localBackupPath `
-            -SqlPackagePath $SqlPackagePath `
-            -LogFile $LogFile
+        $exportSuccess = $false
+
+        switch ($deploymentType) {
+            "AzurePaaS" {
+                Write-StatusMessage "Using Azure SQL Database (PaaS) export method" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Database (PaaS) export method" -Type Info
+                
+                $exportSuccess = Export-SqlDatabaseToBacpac -ServerFQDN $srcServerFQDN `
+                    -DatabaseName $Row.Database_Name `
+                    -Username $Row.SRC_SQL_Admin `
+                    -Password $Row.SRC_SQL_Password `
+                    -OutputPath $localBackupPath `
+                    -SqlPackagePath $SqlPackagePath `
+                    -LogFile $LogFile
+            }
+            
+            "AzureMI" {
+                Write-StatusMessage "Using Azure SQL Managed Instance export method" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Managed Instance export method" -Type Info
+                
+                # TODO: Implement MI-specific export method
+                Write-StatusMessage "Azure SQL Managed Instance export not yet implemented" -Type Warning -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Azure SQL Managed Instance export not yet implemented" -Type Warning
+                
+                $exportSuccess = $false
+            }
+            
+            "AzureIaaS" {
+                Write-StatusMessage "Using Azure SQL IaaS VM export method" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL IaaS VM export method" -Type Info
+                
+                # TODO: Implement IaaS-specific export method
+                Write-StatusMessage "Azure SQL IaaS VM export not yet implemented" -Type Warning -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Azure SQL IaaS VM export not yet implemented" -Type Warning
+                
+                $exportSuccess = $false
+            }
+            
+            default {
+                # Default to AzurePaaS method for backward compatibility
+                Write-StatusMessage "Unknown deployment type. Using default Azure SQL Database (PaaS) export method" -Type Warning -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Unknown deployment type. Using default Azure SQL Database (PaaS) export method" -Type Warning
+                
+                $exportSuccess = Export-SqlDatabaseToBacpac -ServerFQDN $srcServerFQDN `
+                    -DatabaseName $Row.Database_Name `
+                    -Username $Row.SRC_SQL_Admin `
+                    -Password $Row.SRC_SQL_Password `
+                    -OutputPath $localBackupPath `
+                    -SqlPackagePath $SqlPackagePath `
+                    -LogFile $LogFile
+            }
+        }
         
         if (-not $exportSuccess) {
             $errorMessage = "Failed to export database to local file"
@@ -1114,5 +1198,5 @@ function Export-DatabaseOperation {
     }
 }
 
-# # Export all functions
-# Export-ModuleMember -Function Write-StatusMessage, Initialize-Logging, Initialize-OperationLogging, Write-LogMessage, Get-ServerFQDN, Test-Prerequisites, Test-RequiredFields, Test-DiskSpace, Test-SqlServerAccess, Test-StorageAccess, Export-DatabaseOperation, Import-DatabaseOperation, Export-SqlDatabaseToBacpac, Import-BacpacToSqlDatabase, Upload-BacpacToStorage, Download-BacpacFromStorage, Find-LatestBacpacBlob
+# Export all functions
+Export-ModuleMember -Function Write-StatusMessage, Initialize-Logging, Initialize-OperationLogging, Write-LogMessage, Get-ServerFQDN, Test-Prerequisites, Test-RequiredFields, Test-DiskSpace, Test-SqlServerAccess, Test-StorageAccess, Export-DatabaseOperation, Import-DatabaseOperation, Export-SqlDatabaseToBacpac, Import-BacpacToSqlDatabase, Upload-BacpacToStorage, Download-BacpacFromStorage, Find-LatestBacpacBlob

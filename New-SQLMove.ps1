@@ -49,8 +49,6 @@ Process {
         Write-LogMessage -LogFile $logFile -Message "Database Name: $databaseName" -Type Info
         Write-LogMessage -LogFile $logFile -Message "Start Time: $($operationStartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Type Info
 
-      # In the Process block, after parsing the boolean flags, add:
-
         # Parse boolean flags
         $exportAction = [bool]::Parse($row.Export_Action)
         $importAction = [bool]::Parse($row.Import_Action)
@@ -61,14 +59,18 @@ Process {
             $removeTempFile = [bool]::Parse($row.Remove_Tempfile)
         }
 
+        # Get deployment type (default to AzurePaaS if not specified)
+        $deploymentType = if ([string]::IsNullOrEmpty($row.Type)) { "AzurePaaS" } else { $row.Type }
+
         Write-StatusMessage "Export Action: $exportAction" -Type Info -Indent 1
         Write-StatusMessage "Import Action: $importAction" -Type Info -Indent 1
         Write-StatusMessage "Remove Temp File: $removeTempFile" -Type Info -Indent 1
+        Write-StatusMessage "Deployment Type: $deploymentType" -Type Info -Indent 1
         
         Write-LogMessage -LogFile $logFile -Message "Export Action: $exportAction" -Type Info
         Write-LogMessage -LogFile $logFile -Message "Import Action: $importAction" -Type Info
         Write-LogMessage -LogFile $logFile -Message "Remove Temp File: $removeTempFile" -Type Info
-
+        Write-LogMessage -LogFile $logFile -Message "Deployment Type: $deploymentType" -Type Info
 
         # Skip if both actions are false
         if (-not $exportAction -and -not $importAction) {
@@ -195,3 +197,4 @@ Process {
 End {
     Write-StatusMessage "🎉 All database operations completed." -Type Success
 }
+            
