@@ -53,7 +53,59 @@ function Upload-BacpacToStorage {
     }
 }
 
-function Download-BacpacFromStorage {
+function Upload-BakToStorage {
+    [CmdletBinding()]
+    param(
+        [string]$FilePath,
+        [string]$StorageAccount,
+        [string]$ContainerName,
+        [string]$StorageKey,
+        [string]$BlobName,
+        [string]$LogFile
+    )
+    
+    try {
+        $message = "Uploading BAK file to storage for Managed Instance restore..."
+        Write-StatusMessage $message -Type Action -Indent 3
+        Write-LogMessage -LogFile $LogFile -Message $message -Type Action
+        
+        $storageContext = New-AzStorageContext -StorageAccountName $StorageAccount -StorageAccountKey $StorageKey
+        
+        $fileInfo = Get-Item $FilePath
+        $fileSizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
+        
+        $uploadMessage = "Uploading BAK file: $BlobName (Size: $fileSizeMB MB)"
+        Write-StatusMessage $uploadMessage -Type Info -Indent 4
+        Write-LogMessage -LogFile $LogFile -Message $uploadMessage -Type Info
+        
+        $result = Set-AzStorageBlobContent -File $FilePath -Container $ContainerName -Blob $BlobName -Context $storageContext -Force
+        
+        if ($result) {
+            $successMessage = "BAK upload completed successfully"
+            Write-StatusMessage $successMessage -Type Success -Indent 4
+            Write-LogMessage -LogFile $LogFile -Message $successMessage -Type Success
+            
+            $urlMessage = "Blob URL: $($result.ICloudBlob.Uri.AbsoluteUri)"
+            Write-StatusMessage $urlMessage -Type Success -Indent 4
+            Write-LogMessage -LogFile $LogFile -Message $urlMessage -Type Success
+            return $result.ICloudBlob.Uri.AbsoluteUri
+        }
+        else {
+            $errorMessage = "BAK upload failed"
+            Write-StatusMessage $errorMessage -Type Error -Indent 4
+            Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+            return $null
+        }
+    }
+    catch {
+        $errorMessage = "Error uploading BAK to storage: $($_.Exception.Message)"
+        Write-StatusMessage $errorMessage -Type Error -Indent 3
+        Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+        return $null
+    }
+}
+
+function Download-BackupFromStorage {
     [CmdletBinding()]
     param(
         [string]$StorageAccount,
@@ -65,7 +117,8 @@ function Download-BacpacFromStorage {
     )
     
     try {
-        $message = "Downloading BACPAC from storage..."
+        $fileExtension = [System.IO.Path]::GetExtension($BlobName).ToUpper()
+        $message = "Downloading $fileExtension file from storage..."
         Write-StatusMessage $message -Type Action -Indent 3
         Write-LogMessage -LogFile $LogFile -Message $message -Type Action
         
@@ -111,6 +164,22 @@ function Download-BacpacFromStorage {
     }
 }
 
+# Keep the original function for backward compatibility
+function Download-BacpacFromStorage {
+    [CmdletBinding()]
+    param(
+        [string]$StorageAccount,
+        [string]$ContainerName,
+        [string]$StorageKey,
+        [string]$BlobName,
+        [string]$LocalPath,
+        [string]$LogFile
+    )
+    
+    return Download-BackupFromStorage -StorageAccount $StorageAccount -ContainerName $ContainerName -StorageKey $StorageKey -BlobName $BlobName -LocalPath $LocalPath -LogFile $LogFile
+}
+
+# Keep the original function for backward compatibility but make it call the new generic one
 function Find-LatestBacpacBlob {
     [CmdletBinding()]
     param(
@@ -122,27 +191,44 @@ function Find-LatestBacpacBlob {
         [string]$OperationId = $null
     )
     
+    return Find-LatestBackupBlob -StorageAccount $StorageAccount -ContainerName $ContainerName -StorageKey $StorageKey -DatabaseName $DatabaseName -LogFile $LogFile -OperationId $OperationId -FileExtensions @("bacpac")
+}
+
+
+function Find-LatestBackupBlob {
+    [CmdletBinding()]
+    param(
+        [string]$StorageAccount,
+        [string]$ContainerName,
+        [string]$StorageKey,
+        [string]$DatabaseName,
+        [string]$LogFile,
+        [string]$OperationId = $null,
+        [string[]]$FileExtensions = @("bacpac", "bak")
+    )
+    
     try {
-        $message = "Searching for latest BACPAC file for database: $DatabaseName"
+        $message = "Searching for latest backup file for database: $DatabaseName"
         Write-StatusMessage $message -Type Info -Indent 3
         Write-LogMessage -LogFile $LogFile -Message $message -Type Info
         
         $storageContext = New-AzStorageContext -StorageAccountName $StorageAccount -StorageAccountKey $StorageKey
         
-        # Get all blobs that match the database name pattern
-        # Try multiple search patterns to find BACPAC files
+        # Get all blobs that match the database name pattern for specified file extensions
         $searchPatterns = @()
         
-        # If OperationId is provided, search for that specific pattern first
-        if ($OperationId) {
-            $searchPatterns += "${OperationId}_${DatabaseName}*.bacpac"
+        foreach ($extension in $FileExtensions) {
+            # If OperationId is provided, search for that specific pattern first
+            if ($OperationId) {
+                $searchPatterns += "${OperationId}_${DatabaseName}*.$extension"
+            }
+            
+            # Also search for database name with any prefix (covers Operation ID prefixed files)
+            $searchPatterns += "*${DatabaseName}*.$extension"
+            
+            # And search for files that start with just the database name (legacy pattern)
+            $searchPatterns += "${DatabaseName}*.$extension"
         }
-        
-        # Also search for database name with any prefix (covers Operation ID prefixed files)
-        $searchPatterns += "*${DatabaseName}*.bacpac"
-        
-        # And search for files that start with just the database name (legacy pattern)
-        $searchPatterns += "${DatabaseName}*.bacpac"
         
         $allBlobs = @()
         
@@ -160,35 +246,38 @@ function Find-LatestBacpacBlob {
         # Remove duplicates and sort by LastModified descending
         $uniqueBlobs = $allBlobs | Sort-Object Name -Unique | Sort-Object LastModified -Descending
         
-        Write-LogMessage -LogFile $LogFile -Message "Found $($uniqueBlobs.Count) total matching BACPAC files" -Type Info
+        Write-LogMessage -LogFile $LogFile -Message "Found $($uniqueBlobs.Count) total matching backup files" -Type Info
         
         if ($uniqueBlobs.Count -eq 0) {
-            $warningMessage = "No BACPAC files found for database: $DatabaseName"
+            $warningMessage = "No backup files found for database: $DatabaseName"
             Write-StatusMessage $warningMessage -Type Warning -Indent 4
             Write-LogMessage -LogFile $LogFile -Message $warningMessage -Type Warning
             return $null
         }
         
         # Log all found files for debugging
-        Write-LogMessage -LogFile $LogFile -Message "Available BACPAC files:" -Type Info
+        Write-LogMessage -LogFile $LogFile -Message "Available backup files:" -Type Info
         foreach ($blob in $uniqueBlobs) {
             Write-LogMessage -LogFile $LogFile -Message "  - $($blob.Name) (Modified: $($blob.LastModified))" -Type Info
         }
         
         $latestBlob = $uniqueBlobs[0]
-        $foundMessage = "Found latest BACPAC: $($latestBlob.Name) (Modified: $($latestBlob.LastModified))"
+        $foundMessage = "Found latest backup: $($latestBlob.Name) (Modified: $($latestBlob.LastModified))"
         Write-StatusMessage $foundMessage -Type Success -Indent 4
         Write-LogMessage -LogFile $LogFile -Message $foundMessage -Type Success
         
         return $latestBlob.Name
     }
     catch {
-        $errorMessage = "Error searching for BACPAC files: $($_.Exception.Message)"
+        $errorMessage = "Error searching for backup files: $($_.Exception.Message)"
+        Write-StatusMessage $errorMessage -Type Error -
+        $errorMessage = "Error searching for backup files: $($_.Exception.Message)"
         Write-StatusMessage $errorMessage -Type Error -Indent 3
         Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
         return $null
     }
 }
+
 function Write-StatusMessage {
     [CmdletBinding()]
     param(
@@ -1115,203 +1204,7 @@ function Export-DatabaseOperation {
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- #
 #                                                                                           Import funcitons                                                                                           #
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- #
-function Import-DatabaseOperation {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [PSCustomObject]$Row,
-        
-        [Parameter(Mandatory = $true)]
-        [string]$SqlPackagePath,
-        
-        [Parameter(Mandatory = $false)]
-        [string]$LogFile
-    )
-    
-    try {
-        Write-LogMessage -LogFile $LogFile -Message "Starting import database operation" -Type Action
-        
-        $dstServerFQDN = Get-ServerFQDN -ServerName $Row.DST_server
-        $localBackupPath = $Row.Local_Backup_File_Path
 
-        # Get the deployment type - default to AzurePaaS if not specified
-        $deploymentType = if ([string]::IsNullOrEmpty($Row.Type)) { "AzurePaaS" } else { $Row.Type }
-        Write-StatusMessage "Deployment Type: $deploymentType" -Type Info -Indent 2
-        Write-LogMessage -LogFile $LogFile -Message "Deployment Type: $deploymentType" -Type Info
-        
-        # Step 1: Download BACPAC file from storage (if not already local)
-        if (-not (Test-Path $localBackupPath)) {
-            Write-StatusMessage "BACPAC file not found locally, downloading from storage..." -Type Action -Indent 2
-            Write-LogMessage -LogFile $LogFile -Message "BACPAC file not found locally, searching in storage" -Type Info
-            
-            # For import-only operations, we need to find the BACPAC file in storage
-            $blobName = Find-LatestBacpacBlob -StorageAccount $Row.Storage_Account `
-                -ContainerName $Row.Storage_Container `
-                -StorageKey $Row.Storage_Access_Key `
-                -DatabaseName $Row.Database_Name `
-                -LogFile $LogFile
-            
-            if (-not $blobName) {
-                $errorMessage = "No BACPAC file found in storage for database: $($Row.Database_Name)"
-                Write-StatusMessage $errorMessage -Type Error -Indent 2
-                Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-                return $false
-            }
-            
-            $downloadSuccess = Download-BacpacFromStorage -StorageAccount $Row.Storage_Account `
-                -ContainerName $Row.Storage_Container `
-                -StorageKey $Row.Storage_Access_Key `
-                -BlobName $blobName `
-                -LocalPath $localBackupPath `
-                -LogFile $LogFile
-            
-            if (-not $downloadSuccess) {
-                $errorMessage = "Failed to download BACPAC file from storage"
-                Write-StatusMessage $errorMessage -Type Error -Indent 2
-                Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-                return $false
-            }
-        }
-        else {
-            $message = "Using existing local BACPAC file: $localBackupPath"
-            Write-StatusMessage $message -Type Info -Indent 2
-            Write-LogMessage -LogFile $LogFile -Message $message -Type Info
-        }
-        
-        # Step 2: Import BACPAC file to destination database based on deployment type
-        Write-StatusMessage "Importing BACPAC file to destination database..." -Type Action -Indent 2
-        Write-LogMessage -LogFile $LogFile -Message "Starting BACPAC import to destination database" -Type Action
-        
-        $importSuccess = $false
-
-        switch ($deploymentType) {
-            "AzurePaaS" {
-                Write-StatusMessage "Using Azure SQL Database (PaaS) import method" -Type Info -Indent 3
-                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Database (PaaS) import method" -Type Info
-                
-                $importParams = @{
-                    BacpacSource   = $localBackupPath
-                    ServerFQDN     = $dstServerFQDN
-                    DatabaseName   = $Row.Database_Name
-                    Username       = $Row.DST_SQL_Admin
-                    Password       = $Row.DST_SQL_Password
-                    SqlPackagePath = $SqlPackagePath
-                    LogFile        = $LogFile
-                }
-                
-                $importSuccess = Import-BacpacToSqlDatabase @importParams
-            }
-            
-            "AzureMI" {
-                Write-StatusMessage "Using Azure SQL Managed Instance import method" -Type Info -Indent 3
-                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Managed Instance import method" -Type Info
-    
-                # Check if the file is a BAK file (preferred for Managed Instance) or BACPAC
-                $fileExtension = [System.IO.Path]::GetExtension($localBackupPath).ToLower()
-    
-                if ($fileExtension -eq ".bak") {
-                    Write-StatusMessage "Importing BAK file to Azure SQL Managed Instance..." -Type Info -Indent 4
-                    Write-LogMessage -LogFile $LogFile -Message "Using BAK import method for Azure SQL Managed Instance" -Type Info
-        
-                    $importParams = @{
-                        BakSource    = $localBackupPath
-                        ServerFQDN   = $dstServerFQDN
-                        DatabaseName = $Row.Database_Name
-                        Username     = $Row.DST_SQL_Admin
-                        Password     = $Row.DST_SQL_Password
-                        LogFile      = $LogFile
-                        Replace      = $true
-                    }
-        
-                    # Add optional file location parameters if specified in the CSV
-                    if (-not [string]::IsNullOrEmpty($Row.PSObject.Properties['DataFileLocation']) -and 
-                        -not [string]::IsNullOrEmpty($Row.DataFileLocation)) {
-                        $importParams['DataFileLocation'] = $Row.DataFileLocation
-                    }
-        
-                    if (-not [string]::IsNullOrEmpty($Row.PSObject.Properties['LogFileLocation']) -and 
-                        -not [string]::IsNullOrEmpty($Row.LogFileLocation)) {
-                        $importParams['LogFileLocation'] = $Row.LogFileLocation
-                    }
-        
-                    $importSuccess = Import-BakToSqlDatabase @importParams
-                }
-                elseif ($fileExtension -eq ".bacpac") {
-                    Write-StatusMessage "Importing BACPAC file to Azure SQL Managed Instance..." -Type Info -Indent 4
-                    Write-LogMessage -LogFile $LogFile -Message "Using BACPAC import method for Azure SQL Managed Instance" -Type Info
-        
-                    $importParams = @{
-                        BacpacSource   = $localBackupPath
-                        ServerFQDN     = $dstServerFQDN
-                        DatabaseName   = $Row.Database_Name
-                        Username       = $Row.DST_SQL_Admin
-                        Password       = $Row.DST_SQL_Password
-                        SqlPackagePath = $SqlPackagePath
-                        LogFile        = $LogFile
-                    }
-        
-                    $importSuccess = Import-BacpacToSqlDatabase @importParams
-                }
-                else {
-                    $errorMessage = "Unsupported file format for Azure SQL Managed Instance: $fileExtension. Supported formats: .bak, .bacpac"
-                    Write-StatusMessage $errorMessage -Type Error -Indent 4
-                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-                    $importSuccess = $false
-                }
-            }
-
-            
-            "AzureIaaS" {
-                Write-StatusMessage "Using Azure SQL IaaS VM import method" -Type Info -Indent 3
-                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL IaaS VM import method" -Type Info
-                
-                # Call future function for IaaS import
-                Write-StatusMessage "Azure SQL IaaS VM import not yet implemented" -Type Warning -Indent 3
-                Write-LogMessage -LogFile $LogFile -Message "Azure SQL IaaS VM import not yet implemented" -Type Warning
-                
-                # TODO: Call Import-BacpacToSqlIaaS when implemented
-                $importSuccess = $false
-            }
-            
-            default {
-                # Default to AzurePaaS method for backward compatibility
-                Write-StatusMessage "Unknown deployment type. Using default Azure SQL Database (PaaS) import method" -Type Warning -Indent 3
-                Write-LogMessage -LogFile $LogFile -Message "Unknown deployment type. Using default Azure SQL Database (PaaS) import method" -Type Warning
-                
-                $importParams = @{
-                    BacpacSource   = $localBackupPath
-                    ServerFQDN     = $dstServerFQDN
-                    DatabaseName   = $Row.Database_Name
-                    Username       = $Row.DST_SQL_Admin
-                    Password       = $Row.DST_SQL_Password
-                    SqlPackagePath = $SqlPackagePath
-                    LogFile        = $LogFile
-                }
-                
-                $importSuccess = Import-BacpacToSqlDatabase @importParams
-            }
-        }
-        
-        if (-not $importSuccess) {
-            $errorMessage = "Failed to import BACPAC file to destination database"
-            Write-StatusMessage $errorMessage -Type Error -Indent 2
-            Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-            return $false
-        }
-        
-        $successMessage = "Import operation completed successfully"
-        Write-StatusMessage $successMessage -Type Success -Indent 2
-        Write-LogMessage -LogFile $LogFile -Message $successMessage -Type Success
-        return $true
-        
-    }
-    catch {
-        $errorMessage = "Error in import operation: $($_.Exception.Message)"
-        Write-StatusMessage $errorMessage -Type Error -Indent 2
-        Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-        return $false
-    }
-}
 
 function Import-BacpacToSqlDatabase {
     [CmdletBinding()]
@@ -1451,6 +1344,46 @@ function Import-BacpacToSqlDatabase {
     }
 }
 
+# Placeholder for future Managed Instance import method
+function Import-BacpacToSqlManagedInstance {
+    [CmdletBinding()]
+    param(
+        [string]$BacpacSource,
+        [string]$ServerFQDN,
+        [string]$DatabaseName,
+        [string]$Username,
+        [string]$Password,
+        [string]$SqlPackagePath,
+        [string]$LogFile
+    )
+    
+    Write-StatusMessage "Azure SQL Managed Instance import not yet implemented" -Type Warning -Indent 3
+    Write-LogMessage -LogFile $LogFile -Message "Azure SQL Managed Instance import not yet implemented" -Type Warning
+    
+    # TODO: Implement MI-specific import logic
+    return $false
+}
+
+# Placeholder for future IaaS import method
+function Import-BacpacToSqlIaaS {
+    [CmdletBinding()]
+    param(
+        [string]$BacpacSource,
+        [string]$ServerFQDN,
+        [string]$DatabaseName,
+        [string]$Username,
+        [string]$Password,
+        [string]$SqlPackagePath,
+        [string]$LogFile
+    )
+    
+    Write-StatusMessage "Azure SQL IaaS VM import not yet implemented" -Type Warning -Indent 3
+    Write-LogMessage -LogFile $LogFile -Message "Azure SQL IaaS VM import not yet implemented" -Type Warning
+    
+    # TODO: Implement IaaS-specific import logic
+    return $false
+}
+
 function Import-BakToSqlDatabase {
     [CmdletBinding()]
     param(
@@ -1482,7 +1415,17 @@ function Import-BakToSqlDatabase {
         [string]$DataFileLocation,
         
         [Parameter(Mandatory = $false)]
-        [string]$LogFileLocation
+        [string]$LogFileLocation,
+        
+        # New parameters for Azure Managed Instance
+        [Parameter(Mandatory = $false)]
+        [string]$StorageAccount,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$StorageContainer,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$StorageKey
     )
 
     try {
@@ -1509,6 +1452,38 @@ function Import-BakToSqlDatabase {
             return $false
         }
 
+        # Check if this is Azure SQL Managed Instance (contains specific patterns in FQDN)
+        $isAzureManagedInstance = $ServerFQDN -match "\.sql\.azuresynapse\.net$|\.database\.windows\.net$"
+        $bakUrl = $null
+        
+        if ($isAzureManagedInstance -and $StorageAccount -and $StorageContainer -and $StorageKey) {
+            Write-StatusMessage "Detected Azure SQL Managed Instance - uploading BAK to storage first" -Type Info -Indent 4
+            Write-LogMessage -LogFile $LogFile -Message "Azure SQL Managed Instance detected - BAK must be uploaded to storage" -Type Info
+            
+            # Generate blob name with timestamp
+            $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+            $bakFileName = [System.IO.Path]::GetFileNameWithoutExtension($BakSource)
+            $blobName = "${bakFileName}_${timestamp}.bak"
+            
+            # Upload BAK file to storage
+            $bakUrl = Upload-BakToStorage -FilePath $BakSource `
+                -StorageAccount $StorageAccount `
+                -ContainerName $StorageContainer `
+                -StorageKey $StorageKey `
+                -BlobName $blobName `
+                -LogFile $LogFile
+            
+            if (-not $bakUrl) {
+                $errorMessage = "Failed to upload BAK file to storage"
+                Write-StatusMessage $errorMessage -Type Error -Indent 4
+                Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                return $false
+            }
+            
+            Write-StatusMessage "BAK file uploaded successfully, proceeding with restore from URL" -Type Success -Indent 4
+            Write-LogMessage -LogFile $LogFile -Message "BAK file uploaded to: $bakUrl" -Type Success
+        }
+
         # Create SQL connection
         Add-Type -AssemblyName System.Data
         $connectionString = "Server=$ServerFQDN;Database=master;User Id=$Username;Password=$Password;Connection Timeout=30;Encrypt=True;TrustServerCertificate=False;"
@@ -1519,71 +1494,85 @@ function Import-BakToSqlDatabase {
             Write-StatusMessage "Connected to SQL Server successfully" -Type Success -Indent 4
             Write-LogMessage -LogFile $LogFile -Message "Connected to SQL Server successfully" -Type Success
 
-            # First, get the logical file names from the backup
-            Write-StatusMessage "Reading backup file header..." -Type Info -Indent 4
-            Write-LogMessage -LogFile $LogFile -Message "Reading backup file header" -Type Info
-            
-            $fileListCommand = $connection.CreateCommand()
-            $fileListCommand.CommandText = "RESTORE FILELISTONLY FROM DISK = N'$BakSource'"
-            $fileListCommand.CommandTimeout = $CommandTimeout
-            
-            $fileListAdapter = New-Object System.Data.SqlClient.SqlDataAdapter($fileListCommand)
-            $fileListTable = New-Object System.Data.DataTable
-            $fileListAdapter.Fill($fileListTable) | Out-Null
-            
-            if ($fileListTable.Rows.Count -eq 0) {
-                $errorMessage = "Could not read file list from backup file"
-                Write-StatusMessage $errorMessage -Type Error -Indent 4
-                Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-                return $false
-            }
-
-            # Build the RESTORE command
+            # Build the RESTORE command based on whether we're using URL or local file
             $replaceOption = if ($Replace) { "REPLACE, " } else { "" }
+            $restoreSQL = ""
             
-            # Build MOVE options for data and log files
-            $moveOptions = @()
-            foreach ($row in $fileListTable.Rows) {
-                $logicalName = $row["LogicalName"]
-                $fileType = $row["Type"]
+            if ($bakUrl) {
+                # Azure SQL Managed Instance - restore from URL
+                Write-StatusMessage "Using RESTORE FROM URL for Azure SQL Managed Instance" -Type Info -Indent 4
+                Write-LogMessage -LogFile $LogFile -Message "Using RESTORE FROM URL syntax" -Type Info
                 
-                if ($fileType -eq "D") {
-                    # Data file
-                    if ($DataFileLocation) {
-                        $newPath = Join-Path $DataFileLocation "$DatabaseName.mdf"
-                    }
-                    else {
-                        # Use default SQL Server data directory
-                        $newPath = "$DatabaseName.mdf"
-                    }
-                    $moveOptions += "MOVE N'$logicalName' TO N'$newPath'"
+                $restoreSQL = @"
+RESTORE DATABASE [$DatabaseName] 
+FROM URL = N'$bakUrl' 
+WITH $replaceOption NOUNLOAD, STATS = 10
+"@
+            }
+            else {
+                # Traditional SQL Server - get file list and build MOVE options
+                Write-StatusMessage "Reading backup file header..." -Type Info -Indent 4
+                Write-LogMessage -LogFile $LogFile -Message "Reading backup file header" -Type Info
+                
+                $fileListCommand = $connection.CreateCommand()
+                $fileListCommand.CommandText = "RESTORE FILELISTONLY FROM DISK = N'$BakSource'"
+                $fileListCommand.CommandTimeout = $CommandTimeout
+                
+                $fileListAdapter = New-Object System.Data.SqlClient.SqlDataAdapter($fileListCommand)
+                $fileListTable = New-Object System.Data.DataTable
+                $fileListAdapter.Fill($fileListTable) | Out-Null
+                
+                if ($fileListTable.Rows.Count -eq 0) {
+                    $errorMessage = "Could not read file list from backup file"
+                    Write-StatusMessage $errorMessage -Type Error -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                    return $false
                 }
-                elseif ($fileType -eq "L") {
-                    # Log file
-                    if ($LogFileLocation) {
-                        $newPath = Join-Path $LogFileLocation "$DatabaseName.ldf"
-                    }
-                    else {
-                        # Use default SQL Server log directory
-                        $newPath = "$DatabaseName.ldf"
-                    }
-                    $moveOptions += "MOVE N'$logicalName' TO N'$newPath'"
-                }
-            }
-            
-            $moveClause = if ($moveOptions.Count -gt 0) { 
-                ($moveOptions -join ", ") + ", " 
-            }
-            else { 
-                "" 
-            }
 
-            # Build the complete RESTORE command
-            $restoreSQL = @"
+                # Build MOVE options for data and log files
+                $moveOptions = @()
+                foreach ($row in $fileListTable.Rows) {
+                    $logicalName = $row["LogicalName"]
+                    $fileType = $row["Type"]
+                    
+                    if ($fileType -eq "D") {
+                        # Data file
+                        if ($DataFileLocation) {
+                            $newPath = Join-Path $DataFileLocation "$DatabaseName.mdf"
+                        }
+                        else {
+                            # Use default SQL Server data directory
+                            $newPath = "$DatabaseName.mdf"
+                        }
+                        $moveOptions += "MOVE N'$logicalName' TO N'$newPath'"
+                    }
+                    elseif ($fileType -eq "L") {
+                        # Log file
+                        if ($LogFileLocation) {
+                            $newPath = Join-Path $LogFileLocation "$DatabaseName.ldf"
+                        }
+                        else {
+                            # Use default SQL Server log directory
+                            $newPath = "$DatabaseName.ldf"
+                        }
+                        $moveOptions += "MOVE N'$logicalName' TO N'$newPath'"
+                    }
+                }
+                
+                $moveClause = if ($moveOptions.Count -gt 0) { 
+                    ($moveOptions -join ", ") + ", " 
+                }
+                else { 
+                    "" 
+                }
+
+                # Build the complete RESTORE command for traditional SQL Server
+                $restoreSQL = @"
 RESTORE DATABASE [$DatabaseName] 
 FROM DISK = N'$BakSource' 
 WITH $moveClause$replaceOption NOUNLOAD, STATS = 10
 "@
+            }
 
             Write-StatusMessage "Executing database restore..." -Type Info -Indent 4
             Write-LogMessage -LogFile $LogFile -Message "Executing SQL Restore Command: $restoreSQL" -Type Info
@@ -1705,44 +1694,217 @@ WITH $moveClause$replaceOption NOUNLOAD, STATS = 10
     }
 }
 
-# Placeholder for future Managed Instance import method
-function Import-BacpacToSqlManagedInstance {
+# Update the Import-DatabaseOperation function to use the new generic functions
+function Import-DatabaseOperation {
     [CmdletBinding()]
     param(
-        [string]$BacpacSource,
-        [string]$ServerFQDN,
-        [string]$DatabaseName,
-        [string]$Username,
-        [string]$Password,
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$Row,
+        
+        [Parameter(Mandatory = $true)]
         [string]$SqlPackagePath,
+        
+        [Parameter(Mandatory = $false)]
         [string]$LogFile
     )
     
-    Write-StatusMessage "Azure SQL Managed Instance import not yet implemented" -Type Warning -Indent 3
-    Write-LogMessage -LogFile $LogFile -Message "Azure SQL Managed Instance import not yet implemented" -Type Warning
+    try {
+        Write-LogMessage -LogFile $LogFile -Message "Starting import database operation" -Type Action
+        
+        $dstServerFQDN = Get-ServerFQDN -ServerName $Row.DST_server
+        $localBackupPath = $Row.Local_Backup_File_Path
+
+        # Get the deployment type - default to AzurePaaS if not specified
+        $deploymentType = if ([string]::IsNullOrEmpty($Row.Type)) { "AzurePaaS" } else { $Row.Type }
+        Write-StatusMessage "Deployment Type: $deploymentType" -Type Info -Indent 2
+        Write-LogMessage -LogFile $LogFile -Message "Deployment Type: $deploymentType" -Type Info
+        
+        # Step 1: Download backup file from storage (if not already local)
+        if (-not (Test-Path $localBackupPath)) {
+            Write-StatusMessage "Backup file not found locally, downloading from storage..." -Type Action -Indent 2
+            Write-LogMessage -LogFile $LogFile -Message "Backup file not found locally, searching in storage" -Type Info
+            
+            # Determine which file extensions to search for based on deployment type
+            $searchExtensions = switch ($deploymentType) {
+                "AzureMI" { @("bak", "bacpac") }  # Prefer BAK for MI, but allow BACPAC
+                "AzurePaaS" { @("bacpac") }       # Only BACPAC for PaaS
+                "AzureIaaS" { @("bak", "bacpac") } # Both for IaaS
+                default { @("bacpac", "bak") }    # Default to both
+            }
+            
+            # For import-only operations, we need to find the backup file in storage
+            $blobName = Find-LatestBackupBlob -StorageAccount $Row.Storage_Account `
+                -ContainerName $Row.Storage_Container `
+                -StorageKey $Row.Storage_Access_Key `
+                -DatabaseName $Row.Database_Name `
+                -LogFile $LogFile `
+                -FileExtensions $searchExtensions
+            
+            if (-not $blobName) {
+                $errorMessage = "No backup file found in storage for database: $($Row.Database_Name)"
+                Write-StatusMessage $errorMessage -Type Error -Indent 2
+                Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                return $false
+            }
+            
+            # Update the local backup path to match the found file extension
+            $foundExtension = [System.IO.Path]::GetExtension($blobName)
+            $localBackupPath = [System.IO.Path]::ChangeExtension($localBackupPath, $foundExtension)
+            
+            $downloadSuccess = Download-BackupFromStorage -StorageAccount $Row.Storage_Account `
+                -ContainerName $Row.Storage_Container `
+                -StorageKey $Row.Storage_Access_Key `
+                -BlobName $blobName `
+                -LocalPath $localBackupPath `
+                -LogFile $LogFile
+            
+            if (-not $downloadSuccess) {
+                $errorMessage = "Failed to download backup file from storage"
+                Write-StatusMessage $errorMessage -Type Error -Indent 2
+                Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                return $false
+            }
+        }
+        else {
+            $message = "Using existing local backup file: $localBackupPath"
+            Write-StatusMessage $message -Type Info -Indent 2
+            Write-LogMessage -LogFile $LogFile -Message $message -Type Info
+        }
+        
+        # Step 2: Import backup file to destination database based on deployment type
+        Write-StatusMessage "Importing backup file to destination database..." -Type Action -Indent 2
+        Write-LogMessage -LogFile $LogFile -Message "Starting backup import to destination database" -Type Action
+        
+        $importSuccess = $false
+
+        switch ($deploymentType) {
+            "AzurePaaS" {
+                Write-StatusMessage "Using Azure SQL Database (PaaS) import method" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Database (PaaS) import method" -Type Info
+                
+                $importParams = @{
+                    BacpacSource   = $localBackupPath
+                    ServerFQDN     = $dstServerFQDN
+                    DatabaseName   = $Row.Database_Name
+                    Username       = $Row.DST_SQL_Admin
+                    Password       = $Row.DST_SQL_Password
+                    SqlPackagePath = $SqlPackagePath
+                    LogFile        = $LogFile
+                }
+                
+                $importSuccess = Import-BacpacToSqlDatabase @importParams
+            }
+            
+            "AzureMI" {
+                Write-StatusMessage "Using Azure SQL Managed Instance import method" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Managed Instance import method" -Type Info
     
-    # TODO: Implement MI-specific import logic
-    return $false
+                # Check if the file is a BAK file (preferred for Managed Instance) or BACPAC
+                $fileExtension = [System.IO.Path]::GetExtension($localBackupPath).ToLower()
+    
+                if ($fileExtension -eq ".bak") {
+                    Write-StatusMessage "Importing BAK file to Azure SQL Managed Instance..." -Type Info -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message "Using BAK import method for Azure SQL Managed Instance" -Type Info
+        
+                    $importParams = @{
+                        BakSource        = $localBackupPath
+                        ServerFQDN       = $dstServerFQDN
+                        DatabaseName     = $Row.Database_Name
+                        Username         = $Row.DST_SQL_Admin
+                        Password         = $Row.DST_SQL_Password
+                        LogFile          = $LogFile
+                        Replace          = $true
+                        # Add storage parameters for Azure MI
+                        StorageAccount   = $Row.Storage_Account
+                        StorageContainer = $Row.Storage_Container
+                        StorageKey       = $Row.Storage_Access_Key
+                    }
+        
+                    # Add optional file location parameters if specified in the CSV
+                    if (-not [string]::IsNullOrEmpty($Row.PSObject.Properties['DataFileLocation']) -and 
+                        -not [string]::IsNullOrEmpty($Row.DataFileLocation)) {
+                        $importParams['DataFileLocation'] = $Row.DataFileLocation
+                    }
+        
+                    if (-not [string]::IsNullOrEmpty($Row.PSObject.Properties['LogFileLocation']) -and 
+                        -not [string]::IsNullOrEmpty($Row.LogFileLocation)) {
+                        $importParams['LogFileLocation'] = $Row.LogFileLocation
+                    }
+        
+                    $importSuccess = Import-BakToSqlDatabase @importParams
+                }
+                elseif ($fileExtension -eq ".bacpac") {
+                    Write-StatusMessage "Importing BACPAC file to Azure SQL Managed Instance..." -Type Info -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message "Using BACPAC import method for Azure SQL Managed Instance" -Type Info
+        
+                    $importParams = @{
+                        BacpacSource   = $localBackupPath
+                        ServerFQDN     = $dstServerFQDN
+                        DatabaseName   = $Row.Database_Name
+                        Username       = $Row.DST_SQL_Admin
+                        Password       = $Row.DST_SQL_Password
+                        SqlPackagePath = $SqlPackagePath
+                        LogFile        = $LogFile
+                    }
+        
+                    $importSuccess = Import-BacpacToSqlDatabase @importParams
+                }
+                else {
+                    $errorMessage = "Unsupported file format for Azure SQL Managed Instance: $fileExtension. Supported formats: .bak, .bacpac"
+                    Write-StatusMessage $errorMessage -Type Error -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                    $importSuccess = $false
+                }
+            }
+            
+            "AzureIaaS" {
+                Write-StatusMessage "Using Azure SQL IaaS VM import method" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL IaaS VM import method" -Type Info
+                
+                # Call future function for IaaS import
+                Write-StatusMessage "Azure SQL IaaS VM import not yet implemented" -Type Warning -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Azure SQL IaaS VM import not yet implemented" -Type Warning
+                
+                # TODO: Call Import-BacpacToSqlIaaS when implemented
+                $importSuccess = $false
+            }
+            
+            default {
+                # Default to AzurePaaS method for backward compatibility
+                Write-StatusMessage "Unknown deployment type. Using default Azure SQL Database (PaaS) import method" -Type Warning -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Unknown deployment type. Using default Azure SQL Database (PaaS) import method" -Type Warning
+                
+                $importParams = @{
+                    BacpacSource   = $localBackupPath
+                    ServerFQDN     = $dstServerFQDN
+                    DatabaseName   = $Row.Database_Name
+                    Username       = $Row.DST_SQL_Admin
+                    Password       = $Row.DST_SQL_Password
+                    SqlPackagePath = $SqlPackagePath
+                    LogFile        = $LogFile
+                }
+                
+                $importSuccess = Import-BacpacToSqlDatabase @importParams
+            }
+        }
+        
+        if (-not $importSuccess) {
+            $errorMessage = "Failed to import backup file to destination database"
+            Write-StatusMessage $errorMessage -Type Error -Indent 2
+            Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+            return $false
+        }
+        
+        $successMessage = "Import operation completed successfully"
+        Write-StatusMessage $successMessage -Type Success -Indent 2
+        Write-LogMessage -LogFile $LogFile -Message $successMessage -Type Success
+        return $true
+        
+    }
+    catch {
+        $errorMessage = "Error in import operation: $($_.Exception.Message)"
+        Write-StatusMessage $errorMessage -Type Error -Indent 2
+        Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+        return $false
+    }
 }
-
-# Placeholder for future IaaS import method
-function Import-BacpacToSqlIaaS {
-    [CmdletBinding()]
-    param(
-        [string]$BacpacSource,
-        [string]$ServerFQDN,
-        [string]$DatabaseName,
-        [string]$Username,
-        [string]$Password,
-        [string]$SqlPackagePath,
-        [string]$LogFile
-    )
-    
-    Write-StatusMessage "Azure SQL IaaS VM import not yet implemented" -Type Warning -Indent 3
-    Write-LogMessage -LogFile $LogFile -Message "Azure SQL IaaS VM import not yet implemented" -Type Warning
-    
-    # TODO: Implement IaaS-specific import logic
-    return $false
-}
-
-
