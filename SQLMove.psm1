@@ -1246,7 +1246,8 @@ function Import-BacpacToSqlDatabase {
         [string]$Username,
         [string]$Password,
         [string]$SqlPackagePath,
-        [string]$LogFile
+        [string]$LogFile,
+        [switch]$FromStorageUrl = $false
     )
 
     try {
@@ -1257,25 +1258,53 @@ function Import-BacpacToSqlDatabase {
         Write-StatusMessage $message -Type Action -Indent 3
         Write-LogMessage -LogFile $LogFile -Message $message -Type Action
 
-        # Get file size for progress context
+        # Get file size for progress context (only for local files)
         $fileSizeMB = 0
-        if (Test-Path $BacpacSource) {
+        if (-not $FromStorageUrl -and (Test-Path $BacpacSource)) {
             $fileInfo = Get-Item $BacpacSource
             $fileSizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
             $sizeMessage = "Import source size: $fileSizeMB MB"
             Write-StatusMessage $sizeMessage -Type Info -Indent 4
             Write-LogMessage -LogFile $LogFile -Message $sizeMessage -Type Info
         }
+        elseif ($FromStorageUrl) {
+            # Log URL (redact SAS token for security)
+            $urlForLog = $BacpacSource
+            if ($BacpacSource -match '\?') {
+                $urlForLog = $BacpacSource.Substring(0, $BacpacSource.IndexOf('?')) + "?[SAS_TOKEN_REDACTED]"
+            }
+            $message = "Import source: Azure Storage URL ($urlForLog)"
+            Write-StatusMessage $message -Type Info -Indent 4
+            Write-LogMessage -LogFile $LogFile -Message $message -Type Info
+        }
 
-        $importArgs = @(
-            "/action:Import"
-            "/sf:$BacpacSource"
-            "/tsn:$ServerFQDN"
-            "/tdn:$DatabaseName"
-            "/tu:$Username"
-            "/tp:$Password"
-            "/p:CommandTimeout=3600"
-        )
+        # Build import arguments based on source type
+        if ($FromStorageUrl) {
+            $importArgs = @(
+                "/action:Import"
+                "/SourceConnectionString:BacpacUri=$BacpacSource;Storage=StorageUri"
+                "/TargetServerName:$ServerFQDN"
+                "/TargetDatabaseName:$DatabaseName"
+                "/TargetUser:$Username"
+                "/TargetPassword:$Password"
+                "/p:CommandTimeout=3600"
+            )
+            
+            Write-LogMessage -LogFile $LogFile -Message "Using direct import from Azure Storage URL" -Type Info
+        }
+        else {
+            $importArgs = @(
+                "/action:Import"
+                "/SourceFile:$BacpacSource"
+                "/TargetServerName:$ServerFQDN"
+                "/TargetDatabaseName:$DatabaseName"
+                "/TargetUser:$Username"
+                "/TargetPassword:$Password"
+                "/p:CommandTimeout=3600"
+            )
+            
+            Write-LogMessage -LogFile $LogFile -Message "Using local file import" -Type Info
+        }
 
         Write-LogMessage -LogFile $LogFile -Message "SqlPackage import arguments: $($importArgs -join ' ')" -Type Info
 
@@ -1306,7 +1335,8 @@ function Import-BacpacToSqlDatabase {
                 $lastProgressTime = [DateTime]::Now
             }
 
-            Write-Host "`r      $spinChar Importing database as $Username... Time elapsed: $elapsedFormatted" -NoNewline
+            $sourceType = if ($FromStorageUrl) { "Azure Storage URL" } else { "local file" }
+            Write-Host "`r      $spinChar Importing database from $sourceType as $Username... Time elapsed: $elapsedFormatted" -NoNewline
             Start-Sleep -Milliseconds 250
         }
 
@@ -1332,7 +1362,7 @@ function Import-BacpacToSqlDatabase {
             Write-LogMessage -LogFile $LogFile -Message "Started: $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Type Success
             Write-LogMessage -LogFile $LogFile -Message "Completed: $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Type Success
 
-            if ($fileSizeMB -gt 0 -and $totalTime.TotalSeconds -gt 0) {
+            if (-not $FromStorageUrl -and $fileSizeMB -gt 0 -and $totalTime.TotalSeconds -gt 0) {
                 $transferRateMBps = [math]::Round($fileSizeMB / $totalTime.TotalSeconds, 2)
                 $rateMessage = "Transfer rate: $transferRateMBps MB/sec"
                 Write-StatusMessage $rateMessage -Type Success -Indent 4
@@ -1935,13 +1965,18 @@ function Import-DatabaseOperation {
         Write-StatusMessage "Deployment Type: $deploymentType" -Type Info -Indent 2
         Write-LogMessage -LogFile $LogFile -Message "Deployment Type: $deploymentType" -Type Info
         
-        # Step 1: Download BACPAC/BAK file from storage (if not already local)
+        $useDirectImport = $false
+        $blobName = $null
+        $fileExtension = $null
+        $bacpacUrl = $null
+        
+        # Step 1: Check if backup file exists locally or needs to be accessed from storage
         if (-not (Test-Path $localBackupPath)) {
-            Write-StatusMessage "Backup file not found locally, downloading from storage..." -Type Action -Indent 2
+            Write-StatusMessage "Backup file not found locally, searching in Azure Storage..." -Type Action -Indent 2
             Write-LogMessage -LogFile $LogFile -Message "Backup file not found locally, searching in storage" -Type Info
             
             # For import-only operations, we need to find the backup file in storage
-            $blobName = Find-LatestBacpacBlob -StorageAccount $Row.Storage_Account `
+            $blobName = Find-LatestBackupBlob -StorageAccount $Row.Storage_Account `
                 -ContainerName $Row.Storage_Container `
                 -StorageKey $Row.Storage_Access_Key `
                 -DatabaseName $Row.Database_Name `
@@ -1955,36 +1990,70 @@ function Import-DatabaseOperation {
                 return $false
             }
             
-            # Determine if we're downloading a BACPAC or BAK file
+            # Determine if we're dealing with a BACPAC or BAK file
             $fileExtension = [System.IO.Path]::GetExtension($blobName).ToLower()
             Write-StatusMessage "Found backup file: $blobName (Type: $fileExtension)" -Type Info -Indent 3
             Write-LogMessage -LogFile $LogFile -Message "Found backup file: $blobName (Type: $fileExtension)" -Type Info
             
-            # Update local backup path to match the file extension
-            $localBackupDir = Split-Path -Path $localBackupPath -Parent
-            $localBackupFileName = [System.IO.Path]::GetFileNameWithoutExtension($localBackupPath) + $fileExtension
-            $localBackupPath = Join-Path -Path $localBackupDir -ChildPath $localBackupFileName
-            
-            Write-StatusMessage "Updated local backup path: $localBackupPath" -Type Info -Indent 3
-            Write-LogMessage -LogFile $LogFile -Message "Updated local backup path: $localBackupPath" -Type Info
-            
-            # Download the file (works for both BACPAC and BAK)
-            $downloadSuccess = Download-BacpacFromStorage -StorageAccount $Row.Storage_Account `
-                -ContainerName $Row.Storage_Container `
-                -StorageKey $Row.Storage_Access_Key `
-                -BlobName $blobName `
-                -LocalPath $localBackupPath `
-                -LogFile $LogFile
-            
-            if (-not $downloadSuccess) {
-                $errorMessage = "Failed to download backup file from storage"
-                Write-StatusMessage $errorMessage -Type Error -Indent 2
-                Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-                return $false
+            # For BACPAC files with Azure SQL Database (PaaS), we can use direct import
+            if ($fileExtension -eq ".bacpac" -and $deploymentType -eq "AzurePaaS") {
+                Write-StatusMessage "Will use direct import from Azure Storage for BACPAC file" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Will use direct import from Azure Storage for BACPAC file" -Type Info
+                
+                # Generate a SAS token with read permission that expires in a few hours
+                $sasToken = New-SasTokenFromStorageKey -StorageAccount $Row.Storage_Account `
+                    -StorageKey $Row.Storage_Access_Key `
+                    -ContainerName $Row.Storage_Container `
+                    -ExpiryTime (Get-Date).AddHours(4)
+                    
+                if (-not $sasToken) {
+                    $errorMessage = "Failed to generate SAS token for storage access"
+                    Write-StatusMessage $errorMessage -Type Error -Indent 3
+                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                    return $false
+                }
+                
+                # Construct the URL with SAS token
+                $bacpacUrl = "https://$($Row.Storage_Account).blob.core.windows.net/$($Row.Storage_Container)/$blobName`?$sasToken"
+                $useDirectImport = $true
+                
+                # Log URL (redact SAS token for security)
+                $urlForLog = "https://$($Row.Storage_Account).blob.core.windows.net/$($Row.Storage_Container)/$blobName`?[SAS_TOKEN_REDACTED]"
+                Write-LogMessage -LogFile $LogFile -Message "Direct import URL prepared: $urlForLog" -Type Info
+            }
+            else {
+                # For other scenarios (BAK files or non-PaaS deployments), we need to download the file
+                Write-StatusMessage "Will download backup file from Azure Storage first" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Will download backup file from Azure Storage first" -Type Info
+                
+                # Update local backup path to match the file extension
+                $localBackupDir = Split-Path -Path $localBackupPath -Parent
+                $localBackupFileName = [System.IO.Path]::GetFileNameWithoutExtension($localBackupPath) + $fileExtension
+                $localBackupPath = Join-Path -Path $localBackupDir -ChildPath $localBackupFileName
+                
+                Write-StatusMessage "Updated local backup path: $localBackupPath" -Type Info -Indent 3
+                Write-LogMessage -LogFile $LogFile -Message "Updated local backup path: $localBackupPath" -Type Info
+                
+                # Download the file (works for both BACPAC and BAK)
+                $downloadSuccess = Download-BackupFromStorage -StorageAccount $Row.Storage_Account `
+                    -ContainerName $Row.Storage_Container `
+                    -StorageKey $Row.Storage_Access_Key `
+                    -BlobName $blobName `
+                    -LocalPath $localBackupPath `
+                    -LogFile $LogFile
+                
+                if (-not $downloadSuccess) {
+                    $errorMessage = "Failed to download backup file from storage"
+                    Write-StatusMessage $errorMessage -Type Error -Indent 2
+                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                    return $false
+                }
             }
         }
         else {
-            $message = "Using existing local backup file: $localBackupPath"
+            # File exists locally, determine file type
+            $fileExtension = [System.IO.Path]::GetExtension($localBackupPath).ToLower()
+            $message = "Using existing local backup file: $localBackupPath (Type: $fileExtension)"
             Write-StatusMessage $message -Type Info -Indent 2
             Write-LogMessage -LogFile $LogFile -Message $message -Type Info
         }
@@ -1994,7 +2063,6 @@ function Import-DatabaseOperation {
         Write-LogMessage -LogFile $LogFile -Message "Starting backup import to destination database" -Type Action
         
         $importSuccess = $false
-        $fileExtension = [System.IO.Path]::GetExtension($localBackupPath).ToLower()
 
         switch ($deploymentType) {
             "AzurePaaS" {
@@ -2002,17 +2070,41 @@ function Import-DatabaseOperation {
                 Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Database (PaaS) import method" -Type Info
                 
                 if ($fileExtension -eq ".bacpac") {
-                    $importParams = @{
-                        BacpacSource   = $localBackupPath
-                        ServerFQDN     = $dstServerFQDN
-                        DatabaseName   = $Row.Database_Name
-                        Username       = $Row.DST_SQL_Admin
-                        Password       = $Row.DST_SQL_Password
-                        SqlPackagePath = $SqlPackagePath
-                        LogFile        = $LogFile
+                    if ($useDirectImport -and $bacpacUrl) {
+                        # Direct import from URL
+                        Write-StatusMessage "Importing BACPAC directly from Azure Storage..." -Type Info -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message "Using direct import from Azure Storage" -Type Info
+                        
+                        $importParams = @{
+                            BacpacSource   = $bacpacUrl
+                            ServerFQDN     = $dstServerFQDN
+                            DatabaseName   = $Row.Database_Name
+                            Username       = $Row.DST_SQL_Admin
+                            Password       = $Row.DST_SQL_Password
+                            SqlPackagePath = $SqlPackagePath
+                            LogFile        = $LogFile
+                            FromStorageUrl = $true
+                        }
+                        
+                        $importSuccess = Import-BacpacToSqlDatabase @importParams
                     }
-                    
-                    $importSuccess = Import-BacpacToSqlDatabase @importParams
+                    else {
+                        # Traditional import from local file
+                        Write-StatusMessage "Importing BACPAC from local file..." -Type Info -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message "Using local file import" -Type Info
+                        
+                        $importParams = @{
+                            BacpacSource   = $localBackupPath
+                            ServerFQDN     = $dstServerFQDN
+                            DatabaseName   = $Row.Database_Name
+                            Username       = $Row.DST_SQL_Admin
+                            Password       = $Row.DST_SQL_Password
+                            SqlPackagePath = $SqlPackagePath
+                            LogFile        = $LogFile
+                        }
+                        
+                        $importSuccess = Import-BacpacToSqlDatabase @importParams
+                    }
                 }
                 else {
                     $errorMessage = "Azure SQL Database (PaaS) only supports BACPAC files. Found: $fileExtension"
@@ -2146,17 +2238,38 @@ function Import-DatabaseOperation {
                 Write-LogMessage -LogFile $LogFile -Message "Unknown deployment type '$deploymentType'. Using default Azure SQL Database (PaaS) import method" -Type Warning
                 
                 if ($fileExtension -eq ".bacpac") {
-                    $importParams = @{
-                        BacpacSource   = $localBackupPath
-                        ServerFQDN     = $dstServerFQDN
-                        DatabaseName   = $Row.Database_Name
-                        Username       = $Row.DST_SQL_Admin
-                        Password       = $Row.DST_SQL_Password
-                        SqlPackagePath = $SqlPackagePath
-                        LogFile        = $LogFile
+                    if ($useDirectImport -and $bacpacUrl) {
+                        # Direct import from URL
+                        Write-StatusMessage "Importing BACPAC directly from Azure Storage..." -Type Info -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message "Using direct import from Azure Storage" -Type Info
+                        
+                        $importParams = @{
+                            BacpacSource   = $bacpacUrl
+                            ServerFQDN     = $dstServerFQDN
+                            DatabaseName   = $Row.Database_Name
+                            Username       = $Row.DST_SQL_Admin
+                            Password       = $Row.DST_SQL_Password
+                            SqlPackagePath = $SqlPackagePath
+                            LogFile        = $LogFile
+                            FromStorageUrl = $true
+                        }
+                        
+                        $importSuccess = Import-BacpacToSqlDatabase @importParams
                     }
-                    
-                    $importSuccess = Import-BacpacToSqlDatabase @importParams
+                    else {
+                        # Traditional import from local file
+                        $importParams = @{
+                            BacpacSource   = $localBackupPath
+                            ServerFQDN     = $dstServerFQDN
+                            DatabaseName   = $Row.Database_Name
+                            Username       = $Row.DST_SQL_Admin
+                            Password       = $Row.DST_SQL_Password
+                            SqlPackagePath = $SqlPackagePath
+                            LogFile        = $LogFile
+                        }
+                        
+                        $importSuccess = Import-BacpacToSqlDatabase @importParams
+                    }
                 }
                 else {
                     $errorMessage = "Default Azure SQL Database (PaaS) method only supports BACPAC files. Found: $fileExtension"
@@ -2175,28 +2288,31 @@ function Import-DatabaseOperation {
         }
         
         # Step 3: Cleanup local file after successful import (based on Remove_Tempfile setting)
-        $removeTempFile = $true  # Default to true for backward compatibility
-        if ($Row.PSObject.Properties.Name -contains 'Remove_Tempfile') {
-            $removeTempFile = [bool]::Parse($Row.Remove_Tempfile)
-        }
-        
-        if ($removeTempFile) {
-            try {
-                Remove-Item -Path $localBackupPath -Force
-                $message = "Cleaned up local backup file"
+        # Only clean up if we actually downloaded the file (not for direct import)
+        if (-not $useDirectImport -and (Test-Path $localBackupPath)) {
+            $removeTempFile = $true  # Default to true for backward compatibility
+            if ($Row.PSObject.Properties.Name -contains 'Remove_Tempfile') {
+                $removeTempFile = [bool]::Parse($Row.Remove_Tempfile)
+            }
+            
+            if ($removeTempFile) {
+                try {
+                    Remove-Item -Path $localBackupPath -Force
+                    $message = "Cleaned up local backup file"
+                    Write-StatusMessage $message -Type Info -Indent 2
+                    Write-LogMessage -LogFile $LogFile -Message $message -Type Info
+                }
+                catch {
+                    $warningMessage = "Warning: Could not clean up local file: $_"
+                    Write-StatusMessage $warningMessage -Type Warning -Indent 2
+                    Write-LogMessage -LogFile $LogFile -Message $warningMessage -Type Warning
+                }
+            }
+            else {
+                $message = "Local backup file preserved: $localBackupPath"
                 Write-StatusMessage $message -Type Info -Indent 2
                 Write-LogMessage -LogFile $LogFile -Message $message -Type Info
             }
-            catch {
-                $warningMessage = "Warning: Could not clean up local file: $_"
-                Write-StatusMessage $warningMessage -Type Warning -Indent 2
-                Write-LogMessage -LogFile $LogFile -Message $warningMessage -Type Warning
-            }
-        }
-        else {
-            $message = "Local backup file preserved: $localBackupPath"
-            Write-StatusMessage $message -Type Info -Indent 2
-            Write-LogMessage -LogFile $LogFile -Message $message -Type Info
         }
         
         $successMessage = "Import operation completed successfully"
@@ -2206,7 +2322,6 @@ function Import-DatabaseOperation {
         
     }
     catch {
-        $error
         $errorMessage = "Error in import operation: $($_.Exception.Message)"
         Write-StatusMessage $errorMessage -Type Error -Indent 2
         Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
