@@ -11,45 +11,6 @@ The SQL Data Mover module provides comprehensive functionality for:
 - Importing databases from backup files
 - Supporting multiple Azure SQL deployment types
 
-## Architecture
-
-```mermaid
-graph TB
-    subgraph "Source Environment"
-        SRC_DB[(Source Database)]
-        SRC_SERVER[Source SQL Server]
-    end
-    
-    subgraph "Azure Storage"
-        STORAGE[Azure Blob Storage]
-        BACPAC[BACPAC Files]
-        BAK[BAK Files]
-    end
-    
-    subgraph "Destination Environment"
-        DST_SERVER[Destination SQL Server]
-        DST_DB[(Destination Database)]
-    end
-    
-    subgraph "Local Processing"
-        LOCAL[Local Temp Files]
-        SCRIPT[PowerShell Script]
-    end
-    
-    SRC_DB --> SRC_SERVER
-    SRC_SERVER --> LOCAL
-    LOCAL --> STORAGE
-    STORAGE --> BACPAC
-    STORAGE --> BAK
-    STORAGE --> LOCAL
-    LOCAL --> DST_SERVER
-    DST_SERVER --> DST_DB
-    
-    SCRIPT -.-> SRC_SERVER
-    SCRIPT -.-> STORAGE
-    SCRIPT -.-> DST_SERVER
-```
-
 ## Supported Deployment Types
 
 | Deployment Type | Export Format | Import Format | Notes                      |
@@ -58,122 +19,23 @@ graph TB
 | **AzureMI**     | BACPAC/BAK    | BACPAC/BAK    | Azure SQL Managed Instance |
 | **AzureIaaS**   | BACPAC/BAK    | BACPAC/BAK    | SQL Server on Azure VMs    |
 
-## Workflow Diagrams
+## Using the Module
 
-### Export Operation Flow
+The recommended way to use this module is through the `New-SQLMove.ps1` script, which provides a simplified interface to the module functionality.
 
-```mermaid
-flowchart TD
-    START([Start Export Operation]) --> VALIDATE{Validate Prerequisites}
-    VALIDATE -->|Pass| CHECK_TYPE{Check Deployment Type}
-    VALIDATE -->|Fail| ERROR_END([❌ End with Error])
-    
-    CHECK_TYPE -->|AzurePaaS| EXPORT_BACPAC[Export to BACPAC]
-    CHECK_TYPE -->|AzureMI| CHOOSE_FORMAT{Choose Export Format}
-    CHECK_TYPE -->|AzureIaaS| EXPORT_BAK[Export to BAK]
-    
-    CHOOSE_FORMAT -->|BACPAC| EXPORT_BACPAC
-    CHOOSE_FORMAT -->|BAK| EXPORT_BAK
-    
-    EXPORT_BACPAC --> UPLOAD_STORAGE[Upload to Azure Storage]
-    EXPORT_BAK --> UPLOAD_STORAGE
-    
-    UPLOAD_STORAGE --> CLEANUP{Remove Temp Files?}
-    CLEANUP -->|Yes| REMOVE_LOCAL[Remove Local Files]
-    CLEANUP -->|No| KEEP_LOCAL[Keep Local Files]
-    
-    REMOVE_LOCAL --> SUCCESS_END([✅ Export Complete])
-    KEEP_LOCAL --> SUCCESS_END
+```powershell
+.\New-SQLMove.ps1 -CsvPath ".\input\input.csv" -SqlPackagePath "sqlpackage.exe" -LogsFolder ".\logs"
 ```
 
-### Import Operation Flow
+### Parameters
 
-```mermaid
-flowchart TD
-    START([Start Import Operation]) --> CHECK_LOCAL{Local File Exists?}
-    CHECK_LOCAL -->|No| FIND_STORAGE[Find Latest in Storage]
-    CHECK_LOCAL -->|Yes| VALIDATE_TYPE{Validate File Type}
-    
-    FIND_STORAGE --> DOWNLOAD[Download from Storage]
-    DOWNLOAD --> VALIDATE_TYPE
-    
-    VALIDATE_TYPE --> CHECK_DEPLOYMENT{Check Deployment Type}
-    
-    CHECK_DEPLOYMENT -->|AzurePaaS + BACPAC| IMPORT_BACPAC[Import BACPAC via SqlPackage]
-    CHECK_DEPLOYMENT -->|AzureMI + BAK| CHECK_MEMORY{Memory-Optimized Objects?}
-    CHECK_DEPLOYMENT -->|AzureMI + BACPAC| IMPORT_BACPAC
-    CHECK_DEPLOYMENT -->|AzureIaaS + BAK| IMPORT_BAK[Import BAK via SQL RESTORE]
-    CHECK_DEPLOYMENT -->|AzureIaaS + BACPAC| IMPORT_BACPAC
-    
-    CHECK_MEMORY -->|Yes| HANDLE_MEMORY[Handle Memory-Optimized Cleanup]
-    CHECK_MEMORY -->|No| IMPORT_BAK_MI[Import BAK to Managed Instance]
-    
-    HANDLE_MEMORY --> IMPORT_BAK_MI
-    IMPORT_BACPAC --> CLEANUP_FINAL{Remove Temp Files?}
-    IMPORT_BAK --> CLEANUP_FINAL
-    IMPORT_BAK_MI --> CLEANUP_FINAL
-    
-    CLEANUP_FINAL -->|Yes| REMOVE_FINAL[Remove Local Files]
-    CLEANUP_FINAL -->|No| KEEP_FINAL[Keep Local Files]
-    
-    REMOVE_FINAL --> SUCCESS([✅ Import Complete])
-    KEEP_FINAL --> SUCCESS
-```
-
-### Memory-Optimized Objects Handling
-
-```mermaid
-flowchart TD
-    START([BAK File with Memory-Optimized Objects]) --> CHECK_TARGET{Target MI Tier}
-    CHECK_TARGET -->|General Purpose| NEED_CLEANUP[Requires Cleanup]
-    CHECK_TARGET -->|Business Critical| DIRECT_RESTORE[Direct Restore]
-    
-    NEED_CLEANUP --> HAS_INTERMEDIATE{Intermediate Server Available?}
-    HAS_INTERMEDIATE -->|Yes| RESTORE_TEMP[Restore to Intermediate]
-    HAS_INTERMEDIATE -->|No| UPGRADE_TIER[Consider Upgrading MI Tier]
-    
-    RESTORE_TEMP --> CLEANUP_OBJECTS[Remove Memory-Optimized Objects]
-    CLEANUP_OBJECTS --> CREATE_CLEAN_BAK[Create Clean BAK File]
-    CREATE_CLEAN_BAK --> RESTORE_FINAL[Restore to Target MI]
-    CREATE_CLEAN_BAK --> DROP_TEMP[Drop Temporary Database]
-    
-    DIRECT_RESTORE --> SUCCESS([✅ Restore Complete])
-    RESTORE_FINAL --> SUCCESS
-    UPGRADE_TIER --> SUCCESS
-```
-
-## Module Structure
-
-### Core Functions
-
-#### Helper Functions
-- `Upload-BacpacToStorage` - Uploads BACPAC files to Azure Storage
-- `Upload-BakToStorage` - Uploads BAK files to Azure Storage
-- `Download-BackupFromStorage` - Downloads backup files from Azure Storage
-- `Find-LatestBackupBlob` - Finds the most recent backup file in storage
-- `Write-StatusMessage` - Provides formatted console output with colors and emojis
-- `Initialize-Logging` - Sets up logging infrastructure
-- `Write-LogMessage` - Writes messages to log files
-
-#### Export Functions
-- `Export-SqlDatabaseToBacpac` - Exports database to BACPAC using SqlPackage
-- `Export-SqlDatabaseToBak` - Exports database to BAK using SQL BACKUP command
-- `Export-DatabaseOperation` - Main export orchestration function
-
-#### Import Functions
-- `Import-BacpacToSqlDatabase` - Imports BACPAC using SqlPackage
-- `Import-BakToSqlDatabase` - Imports BAK using SQL RESTORE command
-- `Import-DatabaseOperation` - Main import orchestration function
-
-#### Utility Functions
-- `Test-Prerequisites` - Validates required tools and access
-- `Test-RequiredFields` - Validates CSV configuration
-- `Test-DiskSpace` - Checks available disk space
-- `Test-SqlServerAccess` - Tests database connectivity
-- `Test-StorageAccess` - Tests Azure Storage connectivity
-- `Get-ServerFQDN` - Constructs proper Azure SQL FQDNs
+- **CsvPath**: Path to the CSV file containing database operation details (default: `.\input\input.csv`)
+- **SqlPackagePath**: Path to the SqlPackage.exe executable (default: `sqlpackage.exe`)
+- **LogsFolder**: Path to store log files (default: `.\logs`)
 
 ## CSV Configuration
+
+The module requires a properly formatted CSV file with the following fields:
 
 ### Required Fields
 
@@ -204,69 +66,12 @@ flowchart TD
 
 ### Optional Fields
 
-| Field                | Description                         | Default     | Example                |
-| -------------------- | ----------------------------------- | ----------- | ---------------------- |
-| `Type`               | Deployment type                     | `AzurePaaS` | `AzureMI`, `AzureIaaS` |
-| `Remove_Tempfile`    | Clean up local files                | `true`      | `false`                |
-| `IntermediateServer` | Server for memory-optimized cleanup | -           | `sql-vm-temp`          |
-| `DataFileLocation`   | Custom data file location           | -           | `C:\Data\`             |
-| `LogFileLocation`    | Custom log file location            | -           | `C:\Logs\`             |
-
-### Example CSV
-
-```csv
-Operation_ID,Database_Name,Type,SRC_server,SRC_SQL_Admin,SRC_SQL_Password,DST_server,DST_SQL_Admin,DST_SQL_Password,Storage_Account,Storage_Container,Storage_Access_Key,Local_Backup_File_Path,Remove_Tempfile
-001,WideWorldImporters,AzureMI,sql-source.database.windows.net,sqladmin,P@ssw0rd123,sql-mi-target.database.windows.net,sqladmin,P@ssw0rd456,mystorageaccount,backups,base64key...,C:\Temp\WideWorldImporters.bak,true
-002,AdventureWorks,AzurePaaS,sql-onprem,sqladmin,P@ssw0rd123,sql-paas-target.database.windows.net,sqladmin,P@ssw0rd456,mystorageaccount,backups,base64key...,C:\Temp\AdventureWorks.bacpac,false
-```
-
-## Usage Examples
-
-### Basic Export Operation
-
-```powershell
-# Import the module
-Import-Module .\SQLMove.psm1
-
-# Read CSV configuration
-$csvData = Import-Csv -Path "migration-config.csv"
-
-# Process each row for export
-foreach ($row in $csvData) {
-    $logFile = Initialize-OperationLogging -OperationId $row.Operation_ID -DatabaseName $row.Database_Name -StartTime (Get-Date) -LogsFolder "C:\Logs"
-    
-    $success = Export-DatabaseOperation -Row $row -SqlPackagePath "C:\Program Files\Microsoft SQL Server\150\DAC\bin\SqlPackage.exe" -LogFile $logFile
-    
-    if ($success) {
-        Write-Host "✅ Export completed for $($row.Database_Name)" -ForegroundColor Green
-    } else {
-        Write-Host "❌ Export failed for $($row.Database_Name)" -ForegroundColor Red
-    }
-}
-```
-
-### Basic Import Operation
-
-```powershell
-# Import the module
-Import-Module .\SQLMove.psm1
-
-# Read CSV configuration
-$csvData = Import-Csv -Path "migration-config.csv"
-
-# Process each row for import
-foreach ($row in $csvData) {
-    $logFile = Initialize-OperationLogging -OperationId $row.Operation_ID -DatabaseName $row.Database_Name -StartTime (Get-Date) -LogsFolder "C:\Logs"
-    
-    $success = Import-DatabaseOperation -Row $row -SqlPackagePath "C:\Program Files\Microsoft SQL Server\150\DAC\bin\SqlPackage.exe" -LogFile $logFile
-    
-    if ($success) {
-        Write-Host "✅ Import completed for $($row.Database_Name)" -ForegroundColor Green
-    } else {
-        Write-Host "❌ Import failed for $($row.Database_Name)" -ForegroundColor Red
-    }
-}
-```
+| Field             | Description              | Default     | Example                |
+| ----------------- | ------------------------ | ----------- | ---------------------- |
+| `Type`            | Deployment type          | `AzurePaaS` | `AzureMI`, `AzureIaaS` |
+| `Remove_Tempfile` | Clean up local files     | `true`      | `false`                |
+| `Export_Action`   | Perform export operation | `true`      | `false`                |
+| `Import_Action`   | Perform import operation | `true`      | `false`                |
 
 ## Prerequisites
 
@@ -295,112 +100,105 @@ Get-Command SqlPackage.exe -ErrorAction SilentlyContinue
 - **Azure Storage**: Read/Write access to storage account
 - **Local System**: Write access to temporary directories
 
-## Logging and Monitoring
+## Example Usage
 
-### Log File Structure
+1. Create a CSV file with your database operation details (see example in `dev_scripts/example_input.csv`)
+2. Run the script:
 
-```
-C:\Logs\
-├── session_20250627_132000.log          # Session-level log
-├── 001_WideWorldImporters_20250627_132000.log  # Operation-specific log
-└── 002_AdventureWorks_20250627_133000.log      # Operation-specific log
+```powershell
+.\New-SQLMove.ps1 -CsvPath ".\input\input.csv"
 ```
 
-### Log Message Types
-- **📋 Header** - Section headers and major milestones
-- **🔄 Action** - Active operations in progress
-- **ℹ️ Info** - Informational messages
-- **✅ Success** - Successful operations
-- **⚠️ Warning** - Non-critical issues
-- **❌ Error** - Critical errors
+3. Monitor the console output and log files for operation status
 
-### Sample Log Output
+## Workflow Overview
 
-```
-2025-06-27 13:20:00 [Action] Starting BACPAC export from 'WideWorldImporters' on 'sql-source.database.windows.net'...
-2025-06-27 13:20:01 [Info] SqlPackage arguments: /Action:Export /SourceServerName:sql-source.database.windows.net...
-2025-06-27 13:25:30 [Success] Export completed successfully in 00:05:30
-2025-06-27 13:25:30 [Success] BACPAC file size: 245.67 MB
-2025-06-27 13:25:31 [Action] Uploading BACPAC to storage...
-2025-06-27 13:27:45 [Success] Upload completed successfully
-```
+1. **Validation**: The script validates prerequisites and required fields in the CSV
+2. **Pre-flight Checks**: Connectivity to SQL servers and storage is verified
+3. **Export**: If enabled, databases are exported to local files then uploaded to Azure Storage
+4. **Import**: If enabled, databases are imported from local files (downloaded from storage if needed)
+5. **Cleanup**: Temporary files are removed if configured
 
 ## Troubleshooting
 
-### Common Issues
+Common issues and solutions:
 
-#### 1. Memory-Optimized Objects Error
-```
-Error: Memory-optimized filegroup must be empty in order to be restored on General Purpose tier
-```
-**Solutions:**
-- Upgrade target to Business Critical tier
-- Use intermediate server for cleanup
-- Add `IntermediateServer` column to CSV
+- **SqlPackage Not Found**: Ensure the SqlPackage.exe path is correct
+- **Storage Access Denied**: Verify the storage account key is valid
+- **Connection Timeout**: Check firewall rules and connectivity
+- **Insufficient Disk Space**: Ensure enough space for temporary files
 
-#### 2. Storage Access Denied
-```
-Error: Cannot open backup device. Operating system error 5(Access is denied.)
-```
-**Solutions:**
-- Verify SAS token generation
-- Check storage account permissions
-- Ensure credential name matches container URL
+For detailed logging, check the log files generated in the specified log folder.
 
-#### 3. SqlPackage Not Found
-Error: sqlpackage.exe not found at path
-```
-**Solutions:**
-- Install SQL Server Data Tools (SSDT)
-- Update `SqlPackagePath` parameter
-- Verify PATH environment variable
+## Logging
 
-#### 4. Connection Timeout
-```
-Error: Connection timeout expired
-```
-**Solutions:**
-- Check firewall rules
-- Verify server FQDN format
-- Increase connection timeout values
-- Test connectivity with `Test-SqlServerAccess`
+The module creates detailed logs in the specified logs folder:
+- Session-level logs for overall operations
+- Operation-specific logs for each database operation
 
-#### 5. Insufficient Disk Space
-```
-Error: There is not enough space on the disk
-```
-**Solutions:**
-- Clean up temporary directories
-- Increase disk space
-- Use different temporary location
-- Enable `Remove_Tempfile` option
+Log messages include timestamps, message types (Info, Action, Success, Error), and detailed operation information.
 
-### Diagnostic Commands
+## Advanced Usage
+
+### Memory-Optimized Objects Handling
+
+When working with databases containing memory-optimized objects in Azure SQL Managed Instance:
+
+1. **Business Critical tier**: Can directly restore databases with memory-optimized objects
+2. **General Purpose tier**: Requires special handling:
+   - May need an intermediate server to remove memory-optimized objects
+   - Consider upgrading to Business Critical tier if memory-optimized objects are required
+
+### Security Best Practices
+
+- **Never hardcode credentials** in CSV files for production environments
+- **Store CSV files securely** with appropriate access controls
+- **Consider using environment variables** or secure credential stores
+- **Rotate storage keys** regularly
+- **Remove temporary files** after operations complete
+
+### Parallel Processing
+
+For environments with many databases, consider running multiple operations in parallel:
 
 ```powershell
-# Test all prerequisites
-Test-Prerequisites -SqlPackagePath "C:\Program Files\Microsoft SQL Server\150\DAC\bin\SqlPackage.exe" -CsvPath "migration-config.csv"
+$csvData = Import-Csv -Path ".\input\input.csv"
+$jobs = @()
 
-# Test specific server connectivity
-Test-SqlServerAccess -ServerFQDN "sql-server.database.windows.net" -DatabaseName "master" -Username "sqladmin" -Password "password" -Operation "Source" -LogFile "test.log"
+foreach ($row in $csvData) {
+    $scriptBlock = {
+        param($csvRow, $sqlPackagePath, $logsFolder)
+        # Import required module
+        Import-Module .\SQLMove.psm1
+        
+        # Process the row
+        $operationId = $csvRow.Operation_ID
+        $databaseName = $csvRow.Database_Name
+        $logFile = Join-Path -Path $logsFolder -ChildPath "${operationId}_${databaseName}.log"
+        
+        # Process export/import as needed
+        # ... (additional processing code)
+    }
+    
+    $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $row, "sqlpackage.exe", ".\logs"
+    $jobs += $job
+}
 
-# Test storage access
-Test-StorageAccess -StorageAccount "mystorageaccount" -StorageContainer "backups" -StorageKey "base64key..." -LogFile "test.log"
-
-# Check disk space
-Test-DiskSpace -Path "C:\Temp" -RequiredSpaceGB 10 -LogFile "test.log"
+# Wait for all jobs to complete
+$jobs | Wait-Job | Receive-Job
+$jobs | Remove-Job
 ```
 
 ## Performance Considerations
 
 ### File Size Guidelines
 
-| Database Size | Recommended Approach      | Estimated Time |
-| ------------- | ------------------------- | -------------- |
-| < 1 GB        | Direct BACPAC             | 5-15 minutes   |
-| 1-10 GB       | BACPAC with monitoring    | 15-60 minutes  |
-| 10-100 GB     | BAK file preferred        | 30-180 minutes |
-| > 100 GB      | BAK + parallel processing | 2+ hours       |
+| Database Size | Recommended Approach    | Notes                               |
+| ------------- | ----------------------- | ----------------------------------- |
+| < 1 GB        | Direct BACPAC           | Fast for small databases            |
+| 1-10 GB       | BACPAC with monitoring  | Can take 15-60 minutes              |
+| 10-100 GB     | BAK file preferred      | Faster than BACPAC for large DBs    |
+| > 100 GB      | BAK with parallel tasks | Consider splitting large operations |
 
 ### Optimization Tips
 
@@ -411,162 +209,87 @@ Test-DiskSpace -Path "C:\Temp" -RequiredSpaceGB 10 -LogFile "test.log"
 5. **Monitor network bandwidth** during transfers
 6. **Clean up temporary files** to save space
 
-### Parallel Processing Example
+## Module Structure
 
-```powershell
-# Process multiple databases in parallel
-$csvData = Import-Csv -Path "migration-config.csv"
-$jobs = @()
+The module consists of two main components:
 
-foreach ($row in $csvData) {
-    $job = Start-Job -ScriptBlock {
-        param($rowData, $modulePath, $sqlPackagePath)
-        
-        Import-Module $modulePath
-        $logFile = Initialize-OperationLogging -OperationId $rowData.Operation_ID -DatabaseName $rowData.Database_Name -StartTime (Get-Date) -LogsFolder "C:\Logs"
-        
-        Export-DatabaseOperation -Row $rowData -SqlPackagePath $sqlPackagePath -LogFile $logFile
-    } -ArgumentList $row, ".\SQLMove.psm1", "C:\Program Files\Microsoft SQL Server\150\DAC\bin\SqlPackage.exe"
-    
-    $jobs += $job
-}
+1. **SQLMove.psm1**: The core module containing all functions
+2. **New-SQLMove.ps1**: The main script that uses the module functions
 
-# Wait for all jobs to complete
-$jobs | Wait-Job | Receive-Job
-$jobs | Remove-Job
+### Core Functions
+
+- **Test-Prerequisites**: Validates required tools and access
+- **Test-RequiredFields**: Validates CSV configuration
+- **Test-SqlServerAccess**: Tests database connectivity
+- **Test-StorageAccess**: Tests Azure Storage connectivity
+- **Export-DatabaseOperation**: Main export orchestration function
+- **Import-DatabaseOperation**: Main import orchestration function
+- **Get-ServerFQDN**: Constructs proper Azure SQL FQDNs
+- **Initialize-Logging**: Sets up logging infrastructure
+- **Write-LogMessage**: Writes messages to log files
+- **Write-StatusMessage**: Provides formatted console output
+
+## Limitations
+
+- Requires Windows environment for SqlPackage.exe
+- Large databases may take significant time to process
+- Memory-optimized objects require special handling in General Purpose tier
+- Temporary files require sufficient disk space
+
+## Support and Maintenance
+
+For issues, feature requests, or contributions:
+- File issues in the project repository
+- Include detailed error logs and configuration details
+- Provide CSV samples (with sensitive data removed)
+
+## Version History
+
+| Version | Date       | Changes                                      |
+| ------- | ---------- | -------------------------------------------- |
+| 1.0.0   | 2024-05-01 | Initial release                              |
+| 1.1.0   | TBD        | Planned: Enhanced memory-optimized handling  |
+| 1.2.0   | TBD        | Planned: Improved error handling and logging |
+
+## Example Scenarios
+
+### Scenario 1: PaaS to PaaS Migration
+
+Migrating a database from one Azure SQL Database server to another:
+
+```csv
+Operation_ID,Type,SRC_server,SRC_SQL_Admin,SRC_SQL_Password,DST_server,DST_SQL_Admin,DST_SQL_Password,Database_Name,Local_Backup_File_Path,Storage_Account,Storage_Container,Storage_Access_Key,Export_Action,Import_Action,Remove_Tempfile
+001,AzurePaaS,sql-paas-source,sqladmin,SourcePassword,sql-paas-target,sqladmin,TargetPassword,CustomerDB,C:\Temp\CustomerDB.bacpac,storageaccount,migrations,StorageKey123,true,true,true
 ```
 
-## Security Best Practices
+### Scenario 2: On-premises to Managed Instance
 
-### Credential Management
-- **Never hardcode passwords** in scripts
-- **Use Azure Key Vault** for production environments
-- **Rotate storage keys** regularly
-- **Use SAS tokens** with minimal permissions and short expiry
-- **Encrypt CSV files** containing sensitive data
+Migrating from an on-premises SQL Server to Azure SQL Managed Instance:
 
-### Network Security
-- **Enable SSL/TLS** for all connections
-- **Use private endpoints** where possible
-- **Implement firewall rules** for database access
-- **Monitor access logs** for suspicious activity
-
-### Example Secure Configuration
-
-```powershell
-# Using Azure Key Vault for credentials
-$keyVaultName = "my-keyvault"
-$srcPassword = (Get-AzKeyVaultSecret -VaultName $keyVaultName -Name "sql-source-password").SecretValueText
-$dstPassword = (Get-AzKeyVaultSecret -VaultName $keyVaultName -Name "sql-destination-password").SecretValueText
-$storageKey = (Get-AzKeyVaultSecret -VaultName $keyVaultName -Name "storage-account-key").SecretValueText
-
-# Update CSV data with secure credentials
-foreach ($row in $csvData) {
-    $row.SRC_SQL_Password = $srcPassword
-    $row.DST_SQL_Password = $dstPassword
-    $row.Storage_Access_Key = $storageKey
-}
+```csv
+Operation_ID,Type,SRC_server,SRC_SQL_Admin,SRC_SQL_Password,DST_server,DST_SQL_Admin,DST_SQL_Password,Database_Name,Local_Backup_File_Path,Storage_Account,Storage_Container,Storage_Access_Key,Export_Action,Import_Action,Remove_Tempfile
+002,AzureMI,on-prem-sql.contoso.local,sa,OnPremPassword,sqlmi-target.database.windows.net,sqladmin,MIPassword,InventoryDB,C:\Temp\InventoryDB.bak,storageaccount,migrations,StorageKey123,true,true,true
 ```
 
-## Advanced Configuration
+### Scenario 3: Export Only for Backup
 
-### Custom File Naming Patterns
+Creating a backup of an Azure SQL Database without importing:
 
-The module automatically generates file names with the following pattern:
-```
-{OperationID}_{DatabaseName}_{Timestamp}.{Extension}
-```
-
-Example: `001_WideWorldImporters_20250627_132000.bacpac`
-
-### Environment-Specific Settings
-
-```powershell
-# Development environment
-$devConfig = @{
-    StorageAccount = "devstorageaccount"
-    Container = "dev-backups"
-    RemoveTempFiles = $false  # Keep files for debugging
-    LogLevel = "Verbose"
-}
-
-# Production environment
-$prodConfig = @{
-    StorageAccount = "prodstorageaccount"
-    Container = "prod-backups"
-    RemoveTempFiles = $true   # Clean up automatically
-    LogLevel = "Info"
-}
+```csv
+Operation_ID,Type,SRC_server,SRC_SQL_Admin,SRC_SQL_Password,DST_server,DST_SQL_Admin,DST_SQL_Password,Database_Name,Local_Backup_File_Path,Storage_Account,Storage_Container,Storage_Access_Key,Export_Action,Import_Action,Remove_Tempfile
+003,AzurePaaS,sql-paas-prod,sqladmin,ProdPassword,,,,,C:\Backups\WeeklyBackup.bacpac,storageaccount,backups,StorageKey123,true,false,false
 ```
 
-### Custom Backup Retention
+### Scenario 4: Import from Existing Backup
 
-```powershell
-function Remove-OldBackups {
-    param(
-        [string]$StorageAccount,
-        [string]$Container,
-        [string]$StorageKey,
-        [int]$RetentionDays = 30
-    )
-    
-    $context = New-AzStorageContext -StorageAccountName $StorageAccount -StorageAccountKey $StorageKey
-    $cutoffDate = (Get-Date).AddDays(-$RetentionDays)
-    
-    $oldBlobs = Get-AzStorageBlob -Container $Container -Context $context | 
-                Where-Object { $_.LastModified -lt $cutoffDate }
-    
-    foreach ($blob in $oldBlobs) {
-        Remove-AzStorageBlob -Blob $blob.Name -Container $Container -Context $context -Force
-        Write-Host "Removed old backup: $($blob.Name)" -ForegroundColor Yellow
-    }
-}
+Importing a database from an existing backup in Azure Storage:
+
+```csv
+Operation_ID,Type,SRC_server,SRC_SQL_Admin,SRC_SQL_Password,DST_server,DST_SQL_Admin,DST_SQL_Password,Database_Name,Local_Backup_File_Path,Storage_Account,Storage_Container,Storage_Access_Key,Export_Action,Import_Action,Remove_Tempfile
+004,AzurePaaS,,,,,sql-paas-target,sqladmin,TargetPassword,SalesDB,C:\Temp\SalesDB.bacpac,storageaccount,backups,StorageKey123,false,true,true
 ```
 
 ## Integration Examples
-
-### PowerShell Universal Integration
-
-```powershell
-# API endpoint for database migration
-New-PSUEndpoint -Url "/api/migrate-database" -Method POST -Endpoint {
-    param($DatabaseName, $SourceServer, $DestinationServer, $OperationType)
-    
-    try {
-        Import-Module "C:\Scripts\SQLMove.psm1"
-        
-        # Create temporary CSV row
-        $migrationRow = [PSCustomObject]@{
-            Operation_ID = (New-Guid).ToString().Substring(0,8)
-            Database_Name = $DatabaseName
-            Type = "AzureMI"
-            SRC_server = $SourceServer
-            DST_server = $DestinationServer
-            # ... other required fields
-        }
-        
-        $logFile = Initialize-OperationLogging -OperationId $migrationRow.Operation_ID -DatabaseName $DatabaseName -StartTime (Get-Date) -LogsFolder "C:\Logs"
-        
-        if ($OperationType -eq "Export") {
-            $result = Export-DatabaseOperation -Row $migrationRow -SqlPackagePath $SqlPackagePath -LogFile $logFile
-        } else {
-            $result = Import-DatabaseOperation -Row $migrationRow -SqlPackagePath $SqlPackagePath -LogFile $logFile
-        }
-        
-        return @{
-            Success = $result
-            OperationId = $migrationRow.Operation_ID
-            LogFile = $logFile
-        }
-    }
-    catch {
-        return @{
-            Success = $false
-            Error = $_.Exception.Message
-        }
-    }
-}
-```
 
 ### Azure DevOps Pipeline Integration
 
@@ -578,97 +301,106 @@ trigger:
 pool:
   vmImage: 'windows-latest'
 
-variables:
-  sqlPackagePath: 'C:\Program Files\Microsoft SQL Server\150\DAC\bin\SqlPackage.exe'
-
 steps:
-- task: PowerShell@2
-  displayName: 'Database Migration'
+- task: AzurePowerShell@5
   inputs:
-    targetType: 'inline'
-    script: |
-      Import-Module "$(System.DefaultWorkingDirectory)\SQLMove.psm1"
-      
-      $csvData = Import-Csv -Path "$(System.DefaultWorkingDirectory)\migration-config.csv"
-      
-      foreach ($row in $csvData) {
-          $logFile = Initialize-OperationLogging -OperationId $row.Operation_ID -DatabaseName $row.Database_Name -StartTime (Get-Date) -LogsFolder "$(Agent.TempDirectory)\Logs"
-          
-          $success = Export-DatabaseOperation -Row $row -SqlPackagePath "$(sqlPackagePath)" -LogFile $logFile
-          
-          if (-not $success) {
-              Write-Error "Migration failed for $($row.Database_Name)"
-              exit 1
-          }
-      }
+    azureSubscription: 'Your-Azure-Connection'
+    ScriptType: 'FilePath'
+    ScriptPath: '$(System.DefaultWorkingDirectory)/New-SQLMove.ps1'
+    ScriptArguments: '-CsvPath "$(System.DefaultWorkingDirectory)/migration-config.csv" -LogsFolder "$(Build.ArtifactStagingDirectory)/logs"'
+    azurePowerShellVersion: 'LatestVersion'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)/logs'
+    ArtifactName: 'migration-logs'
+    publishLocation: 'Container'
 ```
 
-## Version History
-
-| Version | Date       | Changes                                                |
-| ------- | ---------- | ------------------------------------------------------ |
-| 1.0.0   | 2025-06-27 | Initial release with basic export/import functionality |
-| 1.1.0   | TBD        | Added memory-optimized object handling                 |
-| 1.2.0   | TBD        | Enhanced error handling and logging                    |
-| 1.3.0   | TBD        | Added parallel processing support                      |
-
-## Contributing
-
-### Development Setup
-
-1. Clone the repository
-2. Install required PowerShell modules
-3. Set up test environment with sample databases
-4. Run unit tests before submitting changes
-
-### Testing
+### PowerShell Universal Dashboard Integration
 
 ```powershell
-# Run basic functionality tests
-Pester -Path ".\Tests\SQLMove.Tests.ps1"
-
-# Test with sample data
-$testRow = Import-Csv -Path ".\Tests\test-config.csv" | Select-Object -First 1
-Test-RequiredFields -Row $testRow -ExportAction $true -ImportAction $false
+New-UDDashboard -Title "SQL Database Migration Dashboard" -Content {
+    New-UDRow -Columns {
+        New-UDColumn -Size 12 -Content {
+            New-UDCard -Title "Database Migration Operations" -Content {
+                New-UDForm -Content {
+                    New-UDTextbox -Id "sourceServer" -Label "Source Server"
+                    New-UDTextbox -Id "destServer" -Label "Destination Server"
+                    New-UDTextbox -Id "databaseName" -Label "Database Name"
+                    New-UDCheckbox -Id "exportAction" -Label "Export Database" -Checked
+                    New-UDCheckbox -Id "importAction" -Label "Import Database" -Checked
+                } -OnSubmit {
+                    # Generate CSV content
+                    $csvContent = @"
+Operation_ID,Type,SRC_server,SRC_SQL_Admin,SRC_SQL_Password,DST_server,DST_SQL_Admin,DST_SQL_Password,Database_Name,Local_Backup_File_Path,Storage_Account,Storage_Container,Storage_Access_Key,Export_Action,Import_Action,Remove_Tempfile
+$(New-Guid).ToString().Substring(0,8),AzurePaaS,$($EventData.sourceServer),sqladmin,StoredSecurePassword,$($EventData.destServer),sqladmin,StoredSecurePassword,$($EventData.databaseName),C:\Temp\$($EventData.databaseName).bacpac,storageaccount,migrations,StorageKey123,$($EventData.exportAction.ToString().ToLower()),$($EventData.importAction.ToString().ToLower()),true
+"@
+                    # Save CSV to temp file
+                    $csvPath = "C:\Temp\migration-$(Get-Date -Format 'yyyyMMddHHmmss').csv"
+                    $csvContent | Out-File -FilePath $csvPath
+                    
+                    # Run migration script
+                    Start-Process -FilePath "powershell.exe" -ArgumentList "-File C:\Scripts\New-SQLMove.ps1 -CsvPath `"$csvPath`" -LogsFolder `"C:\Temp\Logs`""
+                    
+                    Show-UDToast -Message "Migration job started" -Duration 5000
+                }
+            }
+        }
+    }
+}
 ```
 
-## Support
+## Scheduled Automation
 
-### Documentation
-- [Azure SQL Documentation](https://docs.microsoft.com/en-us/azure/azure-sql/)
-- [SqlPackage Documentation](https://docs.microsoft.com/en-us/sql/tools/sqlpackage)
-- [PowerShell Az Module](https://docs.microsoft.com/en-us/powershell/azure/)
+For regular database migrations or backups, you can create a scheduled task:
 
-### Common Support Scenarios
+```powershell
+# Create scheduled task to run the SQL Move script
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\Scripts\SQLMove\New-SQLMove.ps1" -CsvPath "C:\Scripts\SQLMove\daily-backup.csv"'
+$trigger = New-ScheduledTaskTrigger -Daily -At 2am
+$principal = New-ScheduledTaskPrincipal -UserId "DOMAIN\ServiceAccount" -LogonType Password
+Register-ScheduledTask -TaskName "SQL-Daily-Backup" -Action $action -Trigger $trigger -Principal $principal -Description "Daily SQL database backup using SQL Move module"
+```
 
-1. **Migration Planning**: Use the module to assess migration complexity
-2. **Bulk Migrations**: Process multiple databases using CSV configuration
-3. **Disaster Recovery**: Automate backup and restore procedures
-4. **Environment Promotion**: Move databases between dev/test/prod environments
+## FAQ
 
-### Contact Information
+### How do I handle sensitive information in CSV files?
 
-For issues, feature requests, or contributions:
-- Create issues in the project repository
-- Follow the contributing guidelines
-- Include detailed error logs and configuration details
+Consider these approaches:
+1. Use environment variables and reference them in your script
+2. Use a secure credential store like Azure Key Vault
+3. Use encrypted CSV files and decrypt at runtime
+4. For scheduled tasks, use the Windows Credential Manager
+
+### Can I use the module with Azure Private Endpoints?
+
+Yes, the module works with private endpoints. Ensure:
+1. The machine running the script has network connectivity to the private endpoints
+2. DNS resolution is correctly configured for private endpoints
+3. The storage account and SQL servers are configured with private endpoints
+
+### How do I monitor the progress of a long-running operation?
+
+1. Monitor the log files in real-time using `Get-Content -Path $logFile -Wait`
+2. Set up email notifications upon completion
+3. Use the `-Verbose` parameter with the script for detailed console output
+
+### How can I extend the module for custom scenarios?
+
+1. Import the module directly: `Import-Module .\SQLMove.psm1`
+2. Use individual functions like `Export-DatabaseOperation` with custom parameters
+3. Create your own wrapper script with additional pre/post processing
+
+## Related Resources
+
+- [Azure SQL Database Documentation](https://docs.microsoft.com/en-us/azure/azure-sql/database/)
+- [Azure SQL Managed Instance Documentation](https://docs.microsoft.com/en-us/azure/azure-sql/managed-instance/)
+- [SqlPackage Documentation](https://docs.microsoft.com/en-us/sql/tools/sqlpackage/sqlpackage)
+- [Azure Storage Documentation](https://docs.microsoft.com/en-us/azure/storage/)
 
 ---
 
-*Last updated: June 27, 2025*
-*Module version: 1.0.0*
-```
+This module is maintained by the Fabrice Semti (fabrice.semti@gmail.com).
 
-This comprehensive README provides:
-
-1. **Visual Architecture** - Mermaid diagrams showing the overall flow
-2. **Detailed Workflows** - Step-by-step process flows for export/import operations
-3. **Configuration Guide** - Complete CSV field documentation with examples
-4. **Usage Examples** - Practical code samples for common scenarios
-5. **Troubleshooting** - Common issues and their solutions
-6. **Performance Guidelines** - Optimization tips and best practices
-7. **Security Considerations** - Best practices for credential management
-8. **Integration Examples** - How to use with PowerShell Universal and Azure DevOps
-9. **Advanced Features** - Custom configurations and parallel processing
-
-The diagrams help visualize the complex workflows, making it easier for users to understand how the module handles different scenarios, especially the memory-optimized objects cleanup process.
+Last updated: June 2025
