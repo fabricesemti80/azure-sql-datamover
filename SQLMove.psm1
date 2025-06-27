@@ -1453,7 +1453,7 @@ function Import-BakToSqlDatabase {
         }
 
         # Check if this is Azure SQL Managed Instance (contains specific patterns in FQDN)
-        $isAzureManagedInstance = $ServerFQDN -match "\.sql\.azuresynapse\.net$|\.database\.windows\.net$"
+        $isAzureManagedInstance = $ServerFQDN -match "\.database\.windows\.net$"
         $bakUrl = $null
         
         if ($isAzureManagedInstance -and $StorageAccount -and $StorageContainer -and $StorageKey) {
@@ -1495,18 +1495,96 @@ function Import-BakToSqlDatabase {
             Write-LogMessage -LogFile $LogFile -Message "Connected to SQL Server successfully" -Type Success
 
             # Build the RESTORE command based on whether we're using URL or local file
-            $replaceOption = if ($Replace) { "REPLACE, " } else { "" }
             $restoreSQL = ""
+            $credentialName = ""
             
             if ($bakUrl) {
-                # Azure SQL Managed Instance - restore from URL
+                # Azure SQL Managed Instance - restore from URL with credential
                 Write-StatusMessage "Using RESTORE FROM URL for Azure SQL Managed Instance" -Type Info -Indent 4
-                Write-LogMessage -LogFile $LogFile -Message "Using RESTORE FROM URL syntax" -Type Info
+                Write-LogMessage -LogFile $LogFile -Message "Using RESTORE FROM URL syntax for Azure SQL Managed Instance" -Type Info
                 
+                # Create a unique credential name for this operation
+                $credentialName = "SQLMoveCredential_$($StorageAccount)_$(Get-Date -Format 'yyyyMMddHHmmss')"
+                
+                Write-StatusMessage "Creating SQL credential for storage access..." -Type Info -Indent 4
+                Write-LogMessage -LogFile $LogFile -Message "Creating SQL credential: $credentialName" -Type Info
+                
+                # Create SQL Server credential for accessing the storage account
+                $createCredentialSQL = @"
+CREATE CREDENTIAL [$credentialName]
+WITH IDENTITY = '$StorageAccount',
+SECRET = '$StorageKey'
+"@
+                
+                $credentialCommand = $connection.CreateCommand()
+                $credentialCommand.CommandText = $createCredentialSQL
+                $credentialCommand.CommandTimeout = $CommandTimeout
+                
+                try {
+                    $credentialCommand.ExecuteNonQuery() | Out-Null
+                    Write-StatusMessage "SQL credential created successfully" -Type Success -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message "SQL credential created successfully" -Type Success
+                }
+                catch {
+                    # If credential already exists, try to drop and recreate
+                    if ($_.Exception.Message -like "*already exists*") {
+                        Write-StatusMessage "Credential exists, recreating..." -Type Info -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message "Credential exists, attempting to recreate" -Type Info
+                        
+                        try {
+                            $dropCredentialCommand = $connection.CreateCommand()
+                            $dropCredentialCommand.CommandText = "DROP CREDENTIAL [$credentialName]"
+                            $dropCredentialCommand.CommandTimeout = $CommandTimeout
+                            $dropCredentialCommand.ExecuteNonQuery() | Out-Null
+                            
+                            # Recreate the credential
+                            $credentialCommand.ExecuteNonQuery() | Out-Null
+                            Write-StatusMessage "SQL credential recreated successfully" -Type Success -Indent 4
+                            Write-LogMessage -LogFile $LogFile -Message "SQL credential recreated successfully" -Type Success
+                        }
+                        catch {
+                            $errorMessage = "Failed to create SQL credential: $($_.Exception.Message)"
+                            Write-StatusMessage $errorMessage -Type Error -Indent 4
+                            Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                            return $false
+                        }
+                    }
+                    else {
+                        $errorMessage = "Failed to create SQL credential: $($_.Exception.Message)"
+                        Write-StatusMessage $errorMessage -Type Error -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                        return $false
+                    }
+                }
+                
+                # For Azure SQL MI, we need to check if database exists first and drop it if Replace is specified
+                if ($Replace) {
+                    Write-StatusMessage "Checking if database exists for replacement..." -Type Info -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message "Checking if database exists for replacement" -Type Info
+                    
+                    $checkDbCommand = $connection.CreateCommand()
+                    $checkDbCommand.CommandText = "SELECT COUNT(*) FROM sys.databases WHERE name = @dbname"
+                    $checkDbCommand.Parameters.AddWithValue("@dbname", $DatabaseName)
+                    $dbExists = [int]$checkDbCommand.ExecuteScalar()
+                    
+                    if ($dbExists -gt 0) {
+                        Write-StatusMessage "Database exists, dropping before restore..." -Type Info -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message "Database exists, dropping before restore" -Type Info
+                        
+                        $dropDbCommand = $connection.CreateCommand()
+                        $dropDbCommand.CommandText = "DROP DATABASE [$DatabaseName]"
+                        $dropDbCommand.CommandTimeout = $CommandTimeout
+                        $dropDbCommand.ExecuteNonQuery() | Out-Null
+                        
+                        Write-StatusMessage "Database dropped successfully" -Type Success -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message "Database dropped successfully" -Type Success
+                    }
+                }
+                
+                # Azure SQL MI restore syntax with credential
                 $restoreSQL = @"
 RESTORE DATABASE [$DatabaseName] 
-FROM URL = N'$bakUrl' 
-WITH $replaceOption NOUNLOAD, STATS = 10
+FROM URL = N'$bakUrl'
 "@
             }
             else {
@@ -1567,6 +1645,7 @@ WITH $replaceOption NOUNLOAD, STATS = 10
                 }
 
                 # Build the complete RESTORE command for traditional SQL Server
+                $replaceOption = if ($Replace) { "REPLACE, " } else { "" }
                 $restoreSQL = @"
 RESTORE DATABASE [$DatabaseName] 
 FROM DISK = N'$BakSource' 
@@ -1586,7 +1665,7 @@ WITH $moveClause$replaceOption NOUNLOAD, STATS = 10
             $spinChars = '|', '/', '-', '\'
             $spinIndex = 0
             $lastProgressTime = [DateTime]::Now
-            $progressInterval = [TimeSpan]::FromSeconds(5)
+            $progressInterval = [TimeSpan]::FromSeconds(10)
             $lastPercentComplete = 0
 
             # Execute the restore command asynchronously
@@ -1599,34 +1678,39 @@ WITH $moveClause$replaceOption NOUNLOAD, STATS = 10
                 $elapsedTime = $stopwatch.Elapsed
                 $elapsedFormatted = "{0:hh\:mm\:ss}" -f $elapsedTime
 
-                # Check for progress every few seconds
+                # For Azure SQL MI, we can't query progress the same way, so just show elapsed time
                 if (([DateTime]::Now - $lastProgressTime) -ge $progressInterval) {
-                    # Query the restore progress using a separate connection
-                    $progressConn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
-                    $progressConn.Open()
-                    $progressCmd = $progressConn.CreateCommand()
-                    $progressCmd.CommandText = "SELECT r.percent_complete FROM sys.dm_exec_requests r WHERE r.session_id = @@SPID AND r.command LIKE 'RESTORE%'"
-                    
-                    try {
-                        $percentComplete = [int]($progressCmd.ExecuteScalar())
-                        if ($percentComplete -gt 0 -and $percentComplete -ne $lastPercentComplete) {
-                            $progressMsg = "Restore progress: $percentComplete% complete"
-                            Write-StatusMessage $progressMsg -Type Info -Indent 4
-                            Write-LogMessage -LogFile $LogFile -Message $progressMsg -Type Info
-                            $lastPercentComplete = $percentComplete
+                    if (-not $isAzureManagedInstance) {
+                        # Query the restore progress using a separate connection (only for traditional SQL Server)
+                        try {
+                            $progressConn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+                            $progressConn.Open()
+                            $progressCmd = $progressConn.CreateCommand()
+                            $progressCmd.CommandText = "SELECT r.percent_complete FROM sys.dm_exec_requests r WHERE r.session_id = @@SPID AND r.command LIKE 'RESTORE%'"
+                            
+                            $percentComplete = [int]($progressCmd.ExecuteScalar())
+                            if ($percentComplete -gt 0 -and $percentComplete -ne $lastPercentComplete) {
+                                $progressMsg = "Restore progress: $percentComplete% complete"
+                                Write-StatusMessage $progressMsg -Type Info -Indent 4
+                                Write-LogMessage -LogFile $LogFile -Message $progressMsg -Type Info
+                                $lastPercentComplete = $percentComplete
+                            }
+                            $progressConn.Close()
+                        }
+                        catch {
+                            # Ignore errors in progress reporting
                         }
                     }
-                    catch {
-                        # Ignore errors in progress reporting
-                    }
-                    finally {
-                        $progressConn.Close()
+                    else {
+                        # For Azure SQL MI, just log elapsed time
+                        Write-LogMessage -LogFile $LogFile -Message "Restore in progress... Elapsed: $elapsedFormatted" -Type Info
                     }
                     
                     $lastProgressTime = [DateTime]::Now
                 }
 
-                Write-Host "`r      $spinChar Restoring database as $Username... Time elapsed: $elapsedFormatted" -NoNewline
+                $serverType = if ($isAzureManagedInstance) { "Azure SQL MI" } else { "SQL Server" }
+                Write-Host "`r      $spinChar Restoring database to $serverType as $Username... Time elapsed: $elapsedFormatted" -NoNewline
                 Start-Sleep -Milliseconds 250
             }
 
@@ -1661,15 +1745,59 @@ WITH $moveClause$replaceOption NOUNLOAD, STATS = 10
                     Write-LogMessage -LogFile $LogFile -Message $rateMessage -Type Success
                 }
 
+                # Clean up the credential after successful restore
+                if ($credentialName -and $isAzureManagedInstance) {
+                    try {
+                        Write-StatusMessage "Cleaning up SQL credential..." -Type Info -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message "Cleaning up SQL credential: $credentialName" -Type Info
+                        
+                        $dropCredentialCommand = $connection.CreateCommand()
+                        $dropCredentialCommand.CommandText = "DROP CREDENTIAL [$credentialName]"
+                        $dropCredentialCommand.CommandTimeout = 30
+                        $dropCredentialCommand.ExecuteNonQuery() | Out-Null
+                        
+                        Write-StatusMessage "SQL credential cleaned up successfully" -Type Success -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message "SQL credential cleaned up successfully" -Type Success
+                    }
+                    catch {
+                        $warningMessage = "Warning: Could not clean up SQL credential: $($_.Exception.Message)"
+                        Write-StatusMessage $warningMessage -Type Warning -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message $warningMessage -Type Warning
+                    }
+                }
+
                 return $true
             }
             else {
                 $errorMessage = "Restore task completed with status: $($task.Status)"
                 if ($task.Exception) {
                     $errorMessage += " - Exception: $($task.Exception.Message)"
+                    # Log inner exceptions for better debugging
+                    if ($task.Exception.InnerException) {
+                        $errorMessage += " - Inner Exception: $($task.Exception.InnerException.Message)"
+                    }
                 }
                 Write-StatusMessage $errorMessage -Type Error -Indent 3
                 Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                
+                # Clean up the credential even on failure
+                if ($credentialName -and $isAzureManagedInstance) {
+                    try {
+                        Write-StatusMessage "Cleaning up SQL credential after failure..." -Type Info -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message "Cleaning up SQL credential after failure: $credentialName" -Type Info
+                        
+                        $dropCredentialCommand = $connection.CreateCommand()
+                        $dropCredentialCommand.CommandText = "DROP CREDENTIAL [$credentialName]"
+                        $dropCredentialCommand.CommandTimeout = 30
+                        $dropCredentialCommand.ExecuteNonQuery() | Out-Null
+                        
+                        Write-LogMessage -LogFile $LogFile -Message "SQL credential cleaned up after failure" -Type Info
+                    }
+                    catch {
+                        Write-LogMessage -LogFile $LogFile -Message "Could not clean up SQL credential after failure: $($_.Exception.Message)" -Type Warning
+                    }
+                }
+                
                 return $false
             }
         }
@@ -1677,6 +1805,24 @@ WITH $moveClause$replaceOption NOUNLOAD, STATS = 10
             $errorMessage = "Error during SQL restore: $($_.Exception.Message)"
             Write-StatusMessage $errorMessage -Type Error -Indent 3
             Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+            
+            # Clean up the credential on exception
+            if ($credentialName -and $isAzureManagedInstance -and $connection -and $connection.State -eq 'Open') {
+                try {
+                    Write-LogMessage -LogFile $LogFile -Message "Cleaning up SQL credential after exception: $credentialName" -Type Info
+                    
+                    $dropCredentialCommand = $connection.CreateCommand()
+                    $dropCredentialCommand.CommandText = "DROP CREDENTIAL [$credentialName]"
+                    $dropCredentialCommand.CommandTimeout = 30
+                    $dropCredentialCommand.ExecuteNonQuery() | Out-Null
+                    
+                    Write-LogMessage -LogFile $LogFile -Message "SQL credential cleaned up after exception" -Type Info
+                }
+                catch {
+                    Write-LogMessage -LogFile $LogFile -Message "Could not clean up SQL credential after exception: $($_.Exception.Message)" -Type Warning
+                }
+            }
+            
             return $false
         }
         finally {
@@ -1693,6 +1839,9 @@ WITH $moveClause$replaceOption NOUNLOAD, STATS = 10
         return $false
     }
 }
+
+
+
 
 # Update the Import-DatabaseOperation function to use the new generic functions
 function Import-DatabaseOperation {
