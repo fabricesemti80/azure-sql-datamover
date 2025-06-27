@@ -1030,7 +1030,7 @@ function Export-DatabaseOperation {
         $originalPath = $Row.Local_Backup_File_Path
         $directory = Split-Path -Path $originalPath -Parent
         $originalFileName = Split-Path -Path $originalPath -Leaf
-        $extension = [System.IO.Path]::GetExtension($originalFileName)
+        $extension = [System.IO.Path]::GetExtension($originalFileName).ToLower()
         $fileNameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($originalFileName)
         
         # Check if the filename already starts with the Operation ID to avoid duplication
@@ -1058,9 +1058,9 @@ function Export-DatabaseOperation {
         # Log the modified path
         Write-LogMessage -LogFile $LogFile -Message "Modified local backup path: $localBackupPath" -Type Info
         
-        # Step 1: Export database to local BACPAC file based on deployment type
-        Write-StatusMessage "Exporting database to local BACPAC file..." -Type Action -Indent 2
-        Write-LogMessage -LogFile $LogFile -Message "Starting BACPAC export to local file: $localBackupPath" -Type Action
+        # Step 1: Export database to local file based on deployment type and file extension
+        Write-StatusMessage "Exporting database to local $extension file..." -Type Action -Indent 2
+        Write-LogMessage -LogFile $LogFile -Message "Starting export to local file: $localBackupPath" -Type Action
         
         $exportSuccess = $false
 
@@ -1068,6 +1068,14 @@ function Export-DatabaseOperation {
             "AzurePaaS" {
                 Write-StatusMessage "Using Azure SQL Database (PaaS) export method" -Type Info -Indent 3
                 Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Database (PaaS) export method" -Type Info
+                
+                # PaaS only supports BACPAC
+                if ($extension -ne ".bacpac") {
+                    $errorMessage = "Azure SQL Database (PaaS) only supports BACPAC export. Invalid extension: $extension"
+                    Write-StatusMessage $errorMessage -Type Error -Indent 3
+                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                    return $false
+                }
                 
                 $exportSuccess = Export-SqlDatabaseToBacpac -ServerFQDN $srcServerFQDN `
                     -DatabaseName $Row.Database_Name `
@@ -1082,7 +1090,8 @@ function Export-DatabaseOperation {
                 Write-StatusMessage "Using Azure SQL Managed Instance export method" -Type Info -Indent 3
                 Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Managed Instance export method" -Type Info
     
-                if ($exportFormat -eq "BAK") {
+                # Choose export method based on file extension
+                if ($extension -eq ".bak") {
                     Write-StatusMessage "Exporting database to BAK file..." -Type Info -Indent 4
                     Write-LogMessage -LogFile $LogFile -Message "Using BAK export format for Azure SQL Managed Instance" -Type Info
         
@@ -1095,7 +1104,7 @@ function Export-DatabaseOperation {
                         -BackupType 'Full' `
                         -Compression 1
                 }
-                else {
+                elseif ($extension -eq ".bacpac") {
                     Write-StatusMessage "Exporting database to BACPAC file..." -Type Info -Indent 4
                     Write-LogMessage -LogFile $LogFile -Message "Using BACPAC export format for Azure SQL Managed Instance" -Type Info
         
@@ -1107,18 +1116,50 @@ function Export-DatabaseOperation {
                         -SqlPackagePath $SqlPackagePath `
                         -LogFile $LogFile
                 }
+                else {
+                    $errorMessage = "Unsupported file extension for export: $extension. Supported formats: .bak, .bacpac"
+                    Write-StatusMessage $errorMessage -Type Error -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                    return $false
+                }
             }
-
             
             "AzureIaaS" {
                 Write-StatusMessage "Using Azure SQL IaaS VM export method" -Type Info -Indent 3
                 Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL IaaS VM export method" -Type Info
                 
-                # TODO: Implement IaaS-specific export method
-                Write-StatusMessage "Azure SQL IaaS VM export not yet implemented" -Type Warning -Indent 3
-                Write-LogMessage -LogFile $LogFile -Message "Azure SQL IaaS VM export not yet implemented" -Type Warning
-                
-                $exportSuccess = $false
+                # Choose export method based on file extension
+                if ($extension -eq ".bak") {
+                    Write-StatusMessage "Exporting database to BAK file..." -Type Info -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message "Using BAK export format for Azure SQL IaaS VM" -Type Info
+        
+                    $exportSuccess = Export-SqlDatabaseToBak -ServerFQDN $srcServerFQDN `
+                        -DatabaseName $Row.Database_Name `
+                        -Username $Row.SRC_SQL_Admin `
+                        -Password $Row.SRC_SQL_Password `
+                        -OutputPath $localBackupPath `
+                        -LogFile $LogFile `
+                        -BackupType 'Full' `
+                        -Compression 1
+                }
+                elseif ($extension -eq ".bacpac") {
+                    Write-StatusMessage "Exporting database to BACPAC file..." -Type Info -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message "Using BACPAC export format for Azure SQL IaaS VM" -Type Info
+        
+                    $exportSuccess = Export-SqlDatabaseToBacpac -ServerFQDN $srcServerFQDN `
+                        -DatabaseName $Row.Database_Name `
+                        -Username $Row.SRC_SQL_Admin `
+                        -Password $Row.SRC_SQL_Password `
+                        -OutputPath $localBackupPath `
+                        -SqlPackagePath $SqlPackagePath `
+                        -LogFile $LogFile
+                }
+                else {
+                    $errorMessage = "Unsupported file extension for export: $extension. Supported formats: .bak, .bacpac"
+                    Write-StatusMessage $errorMessage -Type Error -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                    return $false
+                }
             }
             
             default {
@@ -1126,13 +1167,21 @@ function Export-DatabaseOperation {
                 Write-StatusMessage "Unknown deployment type. Using default Azure SQL Database (PaaS) export method" -Type Warning -Indent 3
                 Write-LogMessage -LogFile $LogFile -Message "Unknown deployment type. Using default Azure SQL Database (PaaS) export method" -Type Warning
                 
-                $exportSuccess = Export-SqlDatabaseToBacpac -ServerFQDN $srcServerFQDN `
-                    -DatabaseName $Row.Database_Name `
-                    -Username $Row.SRC_SQL_Admin `
-                    -Password $Row.SRC_SQL_Password `
-                    -OutputPath $localBackupPath `
-                    -SqlPackagePath $SqlPackagePath `
-                    -LogFile $LogFile
+                if ($extension -eq ".bacpac") {
+                    $exportSuccess = Export-SqlDatabaseToBacpac -ServerFQDN $srcServerFQDN `
+                        -DatabaseName $Row.Database_Name `
+                        -Username $Row.SRC_SQL_Admin `
+                        -Password $Row.SRC_SQL_Password `
+                        -OutputPath $localBackupPath `
+                        -SqlPackagePath $SqlPackagePath `
+                        -LogFile $LogFile
+                }
+                else {
+                    $errorMessage = "Default export method only supports BACPAC files. Invalid extension: $extension"
+                    Write-StatusMessage $errorMessage -Type Error -Indent 3
+                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+                    return $false
+                }
             }
         }
         
@@ -1143,23 +1192,37 @@ function Export-DatabaseOperation {
             return $false
         }
         
-        # Step 2: Upload BACPAC file to storage
-        Write-StatusMessage "Uploading BACPAC file to Azure Storage..." -Type Action -Indent 2
+        # Step 2: Upload file to storage
+        Write-StatusMessage "Uploading $extension file to Azure Storage..." -Type Action -Indent 2
         Write-LogMessage -LogFile $LogFile -Message "Starting upload to Azure Storage" -Type Action
         
         # Generate blob name with Operation ID and timestamp
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $blobName = "$($Row.Operation_ID)_$($Row.Database_Name)_$timestamp.bacpac"
+        $blobName = "$($Row.Operation_ID)_$($Row.Database_Name)_$timestamp$extension"
         
-        $uploadSuccess = Upload-BacpacToStorage -FilePath $localBackupPath `
-            -StorageAccount $Row.Storage_Account `
-            -ContainerName $Row.Storage_Container `
-            -StorageKey $Row.Storage_Access_Key `
-            -BlobName $blobName `
-            -LogFile $LogFile
+        # Use the appropriate upload function based on file extension
+        $uploadSuccess = $false
+        if ($extension -eq ".bacpac") {
+            $uploadSuccess = Upload-BacpacToStorage -FilePath $localBackupPath `
+                -StorageAccount $Row.Storage_Account `
+                -ContainerName $Row.Storage_Container `
+                -StorageKey $Row.Storage_Access_Key `
+                -BlobName $blobName `
+                -LogFile $LogFile
+        }
+        elseif ($extension -eq ".bak") {
+            $uploadUrl = Upload-BakToStorage -FilePath $localBackupPath `
+                -StorageAccount $Row.Storage_Account `
+                -ContainerName $Row.Storage_Container `
+                -StorageKey $Row.Storage_Access_Key `
+                -BlobName $blobName `
+                -LogFile $LogFile
+            
+            $uploadSuccess = ($uploadUrl -ne $null)
+        }
         
         if (-not $uploadSuccess) {
-            $errorMessage = "Failed to upload BACPAC file to storage"
+            $errorMessage = "Failed to upload $extension file to storage"
             Write-StatusMessage $errorMessage -Type Error -Indent 2
             Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
             return $false
@@ -1174,7 +1237,7 @@ function Export-DatabaseOperation {
         if ($removeTempFile) {
             try {
                 Remove-Item -Path $localBackupPath -Force
-                $message = "Cleaned up local BACPAC file"
+                $message = "Cleaned up local file"
                 Write-StatusMessage $message -Type Info -Indent 2
                 Write-LogMessage -LogFile $LogFile -Message $message -Type Info
             }
@@ -1185,7 +1248,7 @@ function Export-DatabaseOperation {
             }
         }
         else {
-            $message = "Local BACPAC file preserved: $localBackupPath"
+            $message = "Local file preserved: $localBackupPath"
             Write-StatusMessage $message -Type Info -Indent 2
             Write-LogMessage -LogFile $LogFile -Message $message -Type Info
         }
@@ -1203,6 +1266,7 @@ function Export-DatabaseOperation {
         return $false
     }
 }
+
 
 function New-SasTokenFromStorageKey {
     [CmdletBinding()]
