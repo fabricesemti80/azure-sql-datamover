@@ -107,7 +107,6 @@ function Upload-BakToStorage {
     }
 }
 
-
 function Download-BackupFromStorage {
     [CmdletBinding()]
     param(
@@ -1089,40 +1088,20 @@ function Export-DatabaseOperation {
             "AzureMI" {
                 Write-StatusMessage "Using Azure SQL Managed Instance export method" -Type Info -Indent 3
                 Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Managed Instance export method" -Type Info
-    
-                # Choose export method based on file extension
-                if ($extension -eq ".bak") {
-                    Write-StatusMessage "Exporting database to BAK file..." -Type Info -Indent 4
-                    Write-LogMessage -LogFile $LogFile -Message "Using BAK export format for Azure SQL Managed Instance" -Type Info
-        
-                    $exportSuccess = Export-SqlDatabaseToBak -ServerFQDN $srcServerFQDN `
-                        -DatabaseName $Row.Database_Name `
-                        -Username $Row.SRC_SQL_Admin `
-                        -Password $Row.SRC_SQL_Password `
-                        -OutputPath $localBackupPath `
-                        -LogFile $LogFile `
-                        -BackupType 'Full' `
-                        -Compression 1
-                }
-                elseif ($extension -eq ".bacpac") {
-                    Write-StatusMessage "Exporting database to BACPAC file..." -Type Info -Indent 4
-                    Write-LogMessage -LogFile $LogFile -Message "Using BACPAC export format for Azure SQL Managed Instance" -Type Info
-        
-                    $exportSuccess = Export-SqlDatabaseToBacpac -ServerFQDN $srcServerFQDN `
-                        -DatabaseName $Row.Database_Name `
-                        -Username $Row.SRC_SQL_Admin `
-                        -Password $Row.SRC_SQL_Password `
-                        -OutputPath $localBackupPath `
-                        -SqlPackagePath $SqlPackagePath `
-                        -LogFile $LogFile
-                }
-                else {
-                    $errorMessage = "Unsupported file extension for export: $extension. Supported formats: .bak, .bacpac"
-                    Write-StatusMessage $errorMessage -Type Error -Indent 4
-                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-                    return $false
-                }
+
+                # Use BACPAC export instead of BAK
+                Write-StatusMessage "Exporting database to BACPAC file..." -Type Info -Indent 4
+                Write-LogMessage -LogFile $LogFile -Message "Using BACPAC export format for Azure SQL Managed Instance" -Type Info
+
+                $exportSuccess = Export-SqlDatabaseToBacpac -ServerFQDN $srcServerFQDN `
+                    -DatabaseName $Row.Database_Name `
+                    -Username $Row.SRC_SQL_Admin `
+                    -Password $Row.SRC_SQL_Password `
+                    -OutputPath $localBackupPath `
+                    -SqlPackagePath $SqlPackagePath `
+                    -LogFile $LogFile
             }
+
             
             "AzureIaaS" {
                 Write-StatusMessage "Using Azure SQL IaaS VM export method" -Type Info -Indent 3
@@ -1267,7 +1246,6 @@ function Export-DatabaseOperation {
     }
 }
 
-
 function New-SasTokenFromStorageKey {
     [CmdletBinding()]
     param(
@@ -1346,7 +1324,7 @@ function Import-BacpacToSqlDatabase {
         if ($FromStorageUrl) {
             $importArgs = @(
                 "/action:Import"
-                "/SourceConnectionString:BacpacUri=$BacpacSource;Storage=StorageUri"
+                "/SourceFile:$BacpacSource"
                 "/TargetServerName:$ServerFQDN"
                 "/TargetDatabaseName:$DatabaseName"
                 "/TargetUser:$Username"
@@ -2181,42 +2159,29 @@ function Import-DatabaseOperation {
             "AzureMI" {
                 Write-StatusMessage "Using Azure SQL Managed Instance import method" -Type Info -Indent 3
                 Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Managed Instance import method" -Type Info
-    
-                if ($fileExtension -eq ".bak") {
-                    Write-StatusMessage "Importing BAK file to Azure SQL Managed Instance..." -Type Info -Indent 4
-                    Write-LogMessage -LogFile $LogFile -Message "Using BAK import method for Azure SQL Managed Instance" -Type Info
+
+                if ($useDirectImport -and $bacpacUrl) {
+                    # Direct import from URL
+                    Write-StatusMessage "Importing BACPAC directly from Azure Storage..." -Type Info -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message "Using direct import from Azure Storage" -Type Info
         
                     $importParams = @{
-                        BakSource        = $localBackupPath
-                        ServerFQDN       = $dstServerFQDN
-                        DatabaseName     = $Row.Database_Name
-                        Username         = $Row.DST_SQL_Admin
-                        Password         = $Row.DST_SQL_Password
-                        LogFile          = $LogFile
-                        Replace          = $true
-                        StorageAccount   = $Row.Storage_Account
-                        StorageContainer = $Row.Storage_Container
-                        StorageKey       = $Row.Storage_Access_Key
+                        BacpacSource   = $bacpacUrl
+                        ServerFQDN     = $dstServerFQDN
+                        DatabaseName   = $Row.Database_Name
+                        Username       = $Row.DST_SQL_Admin
+                        Password       = $Row.DST_SQL_Password
+                        SqlPackagePath = $SqlPackagePath
+                        LogFile        = $LogFile
+                        FromStorageUrl = $true
                     }
         
-                    # Add optional file location parameters if specified in the CSV
-                    if ($Row.PSObject.Properties.Name -contains 'DataFileLocation' -and 
-                        -not [string]::IsNullOrEmpty($Row.DataFileLocation)) {
-                        $importParams['DataFileLocation'] = $Row.DataFileLocation
-                        Write-LogMessage -LogFile $LogFile -Message "Using custom data file location: $($Row.DataFileLocation)" -Type Info
-                    }
-        
-                    if ($Row.PSObject.Properties.Name -contains 'LogFileLocation' -and 
-                        -not [string]::IsNullOrEmpty($Row.LogFileLocation)) {
-                        $importParams['LogFileLocation'] = $Row.LogFileLocation
-                        Write-LogMessage -LogFile $LogFile -Message "Using custom log file location: $($Row.LogFileLocation)" -Type Info
-                    }
-        
-                    $importSuccess = Import-BakToSqlDatabase @importParams
+                    $importSuccess = Import-BacpacToSqlDatabase @importParams
                 }
-                elseif ($fileExtension -eq ".bacpac") {
-                    Write-StatusMessage "Importing BACPAC file to Azure SQL Managed Instance..." -Type Info -Indent 4
-                    Write-LogMessage -LogFile $LogFile -Message "Using BACPAC import method for Azure SQL Managed Instance" -Type Info
+                else {
+                    # Traditional import from local file
+                    Write-StatusMessage "Importing BACPAC from local file..." -Type Info -Indent 4
+                    Write-LogMessage -LogFile $LogFile -Message "Using local file import" -Type Info
         
                     $importParams = @{
                         BacpacSource   = $localBackupPath
@@ -2230,14 +2195,8 @@ function Import-DatabaseOperation {
         
                     $importSuccess = Import-BacpacToSqlDatabase @importParams
                 }
-                else {
-                    $errorMessage = "Unsupported file format for Azure SQL Managed Instance: $fileExtension. Supported formats: .bak, .bacpac"
-                    Write-StatusMessage $errorMessage -Type Error -Indent 4
-                    Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-                    $importSuccess = $false
-                }
             }
-            
+
             "AzureIaaS" {
                 Write-StatusMessage "Using Azure SQL IaaS VM import method" -Type Info -Indent 3
                 Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL IaaS VM import method" -Type Info
