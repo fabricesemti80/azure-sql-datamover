@@ -1177,6 +1177,8 @@ function Export-DatabaseOperation {
         
         # Generate blob name with Operation ID and timestamp
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $fileNameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($Row.Local_Backup_File_Path)
+        $extension = [System.IO.Path]::GetExtension($Row.Local_Backup_File_Path)
         $blobName = "$($Row.Operation_ID)_$($Row.Database_Name)_$timestamp$extension"
         
         # Use the appropriate upload function based on file extension
@@ -1697,13 +1699,28 @@ SECRET = '$sasToken';
                         Write-StatusMessage "Database exists, dropping before restore..." -Type Info -Indent 4
                         Write-LogMessage -LogFile $LogFile -Message "Database exists, dropping before restore" -Type Info
                         
-                        # First, ensure no active connections to the database
+                        # First, kill all existing connections
                         $killConnectionsCommand = $connection.CreateCommand()
                         $killConnectionsCommand.CommandText = @"
-ALTER DATABASE [$DatabaseName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-DROP DATABASE [$DatabaseName];
+IF EXISTS (SELECT * FROM sys.databases WHERE name = '$($Row.Database_Name)')
+BEGIN
+    SELECT session_id INTO #tempSessions FROM sys.dm_exec_sessions 
+    WHERE database_id = DB_ID('$($Row.Database_Name)');
+    
+    DECLARE @kill varchar(8000) = '';
+    SELECT @kill = @kill + 'KILL ' + CONVERT(varchar(5), session_id) + ';'
+    FROM #tempSessions;
+    
+    EXEC(@kill);
+    DROP TABLE #tempSessions;
+END
 "@
-                        $killConnectionsCommand.CommandTimeout = $CommandTimeout
+                        $killConnectionsCommand.ExecuteNonQuery()
+
+                        # Then drop the database
+                        $dropCommand = $connection.CreateCommand()
+                        $dropCommand.CommandText = "DROP DATABASE IF EXISTS [$($Row.Database_Name)]"
+                        $dropCommand.ExecuteNonQuery()
                         
                         try {
                             $killConnectionsCommand.ExecuteNonQuery() | Out-Null
@@ -2024,6 +2041,10 @@ function Import-DatabaseOperation {
                 -DatabaseName $Row.Database_Name `
                 -LogFile $LogFile `
                 -OperationId $Row.Operation_ID
+
+            # Add debug logging for blob name components
+            Write-LogMessage -LogFile $LogFile -Message "Blob search result:" -Type Info
+            Write-LogMessage -LogFile $LogFile -Message "Found blob name: $blobName" -Type Info
             
             if (-not $blobName) {
                 $errorMessage = "No backup file found in storage for database: $($Row.Database_Name)"
@@ -2034,6 +2055,7 @@ function Import-DatabaseOperation {
             
             # Determine if we're dealing with a BACPAC or BAK file
             $fileExtension = [System.IO.Path]::GetExtension($blobName).ToLower()
+            Write-LogMessage -LogFile $LogFile -Message "File extension from blob: $fileExtension" -Type Info
             Write-StatusMessage "Found backup file: $blobName (Type: $fileExtension)" -Type Info -Indent 3
             Write-LogMessage -LogFile $LogFile -Message "Found backup file: $blobName (Type: $fileExtension)" -Type Info
             
@@ -2160,11 +2182,39 @@ function Import-DatabaseOperation {
                 Write-StatusMessage "Using Azure SQL Managed Instance import method" -Type Info -Indent 3
                 Write-LogMessage -LogFile $LogFile -Message "Using Azure SQL Managed Instance import method" -Type Info
 
+                # Check and drop existing database if it exists
+                $connectionString = "Server=$dstServerFQDN;Database=master;User Id=$($Row.DST_SQL_Admin);Password=$($Row.DST_SQL_Password);Connection Timeout=30;Encrypt=True;TrustServerCertificate=False;"
+                $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+    
+                try {
+                    $connection.Open()
+                    $checkDbCommand = $connection.CreateCommand()
+                    $checkDbCommand.CommandText = "SELECT COUNT(*) FROM sys.databases WHERE name = @dbname"
+                    $checkDbCommand.Parameters.AddWithValue("@dbname", $Row.Database_Name)
+                    $dbExists = [int]$checkDbCommand.ExecuteScalar()
+        
+                    if ($dbExists -gt 0) {
+                        Write-StatusMessage "Database exists, dropping before import..." -Type Info -Indent 4
+                        Write-LogMessage -LogFile $LogFile -Message "Dropping existing database before import" -Type Info
+            
+                        $dropCommand = $connection.CreateCommand()
+                        $dropCommand.CommandText = @"
+ALTER DATABASE [$($Row.Database_Name)] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+DROP DATABASE [$($Row.Database_Name)];
+"@
+                        $dropCommand.ExecuteNonQuery()
+                        Write-StatusMessage "Existing database dropped successfully" -Type Success -Indent 4
+                    }
+                }
+                finally {
+                    $connection.Close()
+                }
+
                 if ($useDirectImport -and $bacpacUrl) {
                     # Direct import from URL
                     Write-StatusMessage "Importing BACPAC directly from Azure Storage..." -Type Info -Indent 4
                     Write-LogMessage -LogFile $LogFile -Message "Using direct import from Azure Storage" -Type Info
-        
+
                     $importParams = @{
                         BacpacSource   = $bacpacUrl
                         ServerFQDN     = $dstServerFQDN
@@ -2175,14 +2225,14 @@ function Import-DatabaseOperation {
                         LogFile        = $LogFile
                         FromStorageUrl = $true
                     }
-        
+
                     $importSuccess = Import-BacpacToSqlDatabase @importParams
                 }
                 else {
                     # Traditional import from local file
                     Write-StatusMessage "Importing BACPAC from local file..." -Type Info -Indent 4
                     Write-LogMessage -LogFile $LogFile -Message "Using local file import" -Type Info
-        
+
                     $importParams = @{
                         BacpacSource   = $localBackupPath
                         ServerFQDN     = $dstServerFQDN
@@ -2192,7 +2242,7 @@ function Import-DatabaseOperation {
                         SqlPackagePath = $SqlPackagePath
                         LogFile        = $LogFile
                     }
-        
+
                     $importSuccess = Import-BacpacToSqlDatabase @importParams
                 }
             }
