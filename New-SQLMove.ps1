@@ -130,8 +130,7 @@ Process {
 
         # Check disk space if export is enabled
         if ($exportAction) {
-            $localBackupDir = Split-Path -Path $row.Local_Backup_File_Path -Parent
-            if (-not (Test-DiskSpace -Path $localBackupDir -RequiredSpaceGB 10 -LogFile $logFile)) {
+            if (-not (Test-DiskSpace -Path $row.Local_Folder -RequiredSpaceGB 10 -LogFile $logFile)) {
                 $preflightSuccess = $false
             }
         }
@@ -197,4 +196,3 @@ Process {
 End {
     Write-StatusMessage "🎉 All database operations completed." -Type Success
 }
-            

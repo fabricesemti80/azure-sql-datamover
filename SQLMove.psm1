@@ -253,7 +253,7 @@ function Test-RequiredFields {
     
     # Export-specific required fields
     if ($ExportAction) {
-        $exportFields = @('SRC_server', 'SRC_SQL_Admin', 'SRC_SQL_Password', 'Local_Backup_File_Path')
+        $exportFields = @('SRC_server', 'SRC_SQL_Admin', 'SRC_SQL_Password')
         foreach ($field in $exportFields) {
             if ([string]::IsNullOrEmpty($Row.$field)) {
                 $missingFields += $field
@@ -503,7 +503,7 @@ function Test-OperationRequirements {
     
     $requirements = @{
         'Common' = @('Operation_ID', 'Database_Name', 'Storage_Account', 'Storage_Container', 'Storage_Access_Key')
-        'Export' = @('SRC_server', 'SRC_SQL_Admin', 'SRC_SQL_Password', 'Local_Backup_File_Path')
+        'Export' = @('SRC_server', 'SRC_SQL_Admin', 'SRC_SQL_Password')
         'Import' = @('DST_server', 'DST_SQL_Admin', 'DST_SQL_Password')
     }
     
@@ -935,89 +935,23 @@ function New-SasTokenFromStorageKey {
 
 # New helper function to handle backup file management
 function Get-BackupFileInfo {
+    [CmdletBinding()]
     param(
-        [PSCustomObject]$Row,
-        [string]$LogFile
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$Row
     )
-    
-    $result = @{
-        Success         = $false
-        IsDirectImport  = $false
-        LocalPath       = $Row.Local_Backup_File_Path
-        BackupUrl       = $null
-        RequiresCleanup = $false
-    }
-    
-    if (-not (Test-Path $result.LocalPath)) {
-        Write-OperationStatus "Searching for backup in Azure Storage..." -Type Action -Indent 2 -LogFile $LogFile
-        
-        $blobName = Find-LatestBackupBlob -StorageAccount $Row.Storage_Account `
-            -ContainerName $Row.Storage_Container `
-            -StorageKey $Row.Storage_Access_Key `
-            -DatabaseName $Row.Database_Name `
-            -OperationId $Row.Operation_ID `
-            -LogFile $LogFile
-            
-        if (-not $blobName) {
-            return $result
-        }
-        
-        $fileExtension = [System.IO.Path]::GetExtension($blobName).ToLower()
-        $deploymentType = $Row.Type ?? "AzurePaaS"
-        
-        if ($fileExtension -eq ".bacpac" -and $deploymentType -eq "AzurePaaS") {
-            Write-StatusMessage "Using direct import from Azure Storage for BACPAC file" -Type Info -Indent 3
-    
-            $sasToken = New-SasTokenFromStorageKey -StorageAccount $Row.Storage_Account `
-                -StorageKey $Row.Storage_Access_Key `
-                -ContainerName $Row.Storage_Container `
-                -ExpiryTime (Get-Date).AddHours(4)
-    
-            # Construct URL ensuring proper format
-            $storageUrl = "https://$($Row.Storage_Account).blob.core.windows.net"
-            $containerPath = "$($Row.Storage_Container)/$blobName"
-            $bacpacUrl = "$storageUrl/$containerPath"
-            if ($sasToken) {
-                $bacpacUrl += "?$sasToken"
-            }
-    
-            # Log URL (with redacted SAS token)
-            $logUrl = "$storageUrl/$containerPath?[REDACTED]"
-            Write-StatusMessage "Import URL: $logUrl" -Type Info -Indent 3
-            Write-LogMessage -LogFile $LogFile -Message "Using storage URL for import" -Type Info
-    
-            $importParams = @{
-                BacpacSource   = $bacpacUrl
-                ServerFQDN     = $dstServerFQDN
-                DatabaseName   = $Row.Database_Name
-                Username       = $Row.DST_SQL_Admin
-                Password       = $Row.DST_SQL_Password
-                SqlPackagePath = $SqlPackagePath
-                LogFile        = $LogFile
-            }
-    
-            $importSuccess = Import-BacpacToSqlDatabase @importParams
-        }
 
-        else {
-            $result.LocalPath = Join-Path (Split-Path $result.LocalPath) "$($Row.Operation_ID)_$(Split-Path $result.LocalPath -Leaf)"
-            $downloadSuccess = Download-BackupFromStorage -StorageAccount $Row.Storage_Account `
-                -ContainerName $Row.Storage_Container `
-                -StorageKey $Row.Storage_Access_Key `
-                -BlobName $blobName `
-                -LocalPath $result.LocalPath `
-                -LogFile $LogFile
-                
-            $result.Success = $downloadSuccess
-            $result.RequiresCleanup = $downloadSuccess
-        }
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $extension = ".bacpac"  # Default to .bacpac for Azure SQL
+    $backupFileName = "$($Row.Operation_ID)_$($Row.Database_Name)_${timestamp}${extension}"
+    $localBackupPath = Join-Path -Path $Row.Local_Folder -ChildPath $backupFileName
+
+    return @{
+        FileName = $backupFileName
+        FullPath = $localBackupPath
     }
-    else {
-        $result.Success = $true
-    }
-    
-    return $result
 }
+
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- #
 #                                                                                           Export functions                                                                                           #
@@ -1342,12 +1276,11 @@ function Export-DatabaseOperation {
         $srcServerFQDN = Get-ServerFQDN -ServerName $Row.SRC_server
         $deploymentType = if ([string]::IsNullOrEmpty($Row.Type)) { "AzurePaaS" } else { $Row.Type }
         
-        # Generate timestamped filename at the start
+        # Generate backup file path from components
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $fileNameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($Row.Local_Backup_File_Path)
-        $extension = [System.IO.Path]::GetExtension($Row.Local_Backup_File_Path)
-        $backupFileName = "$($Row.Operation_ID)_${fileNameWithoutExt}_${timestamp}${extension}"
-        $localBackupPath = Join-Path -Path (Split-Path -Path $Row.Local_Backup_File_Path -Parent) -ChildPath $backupFileName
+        $extension = ".bacpac"  # Default to .bacpac for Azure SQL
+        $backupFileName = "$($Row.Operation_ID)_$($Row.Database_Name)_${timestamp}${extension}"
+        $localBackupPath = Join-Path -Path $Row.Local_Folder -ChildPath $backupFileName
         
         Write-StatusMessage "Using backup file: $backupFileName" -Type Info -Indent 2
         Write-LogMessage -LogFile $LogFile -Message "Using backup file: $backupFileName" -Type Info
@@ -1410,6 +1343,7 @@ function Export-DatabaseOperation {
         return $false
     }
 }
+
 
 function Export-BacpacWithProgress {
     [CmdletBinding()]
@@ -2191,8 +2125,7 @@ function Import-DatabaseOperation {
         }
 
         # Use the exact same filename for local path
-        $localBackupDir = Split-Path -Path $Row.Local_Backup_File_Path -Parent
-        $localBackupPath = Join-Path -Path $localBackupDir -ChildPath $blobName
+        $localBackupPath = Join-Path -Path $Row.Local_Folder -ChildPath $blobName
         
         $downloadSuccess = Download-BackupFromStorage -StorageAccount $Row.Storage_Account `
             -ContainerName $Row.Storage_Container `
@@ -2249,3 +2182,4 @@ function Import-DatabaseOperation {
         return $false
     }
 }
+
