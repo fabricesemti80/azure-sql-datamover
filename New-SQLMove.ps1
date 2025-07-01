@@ -22,6 +22,14 @@ Begin {
     # Read the CSV file
     $csvData = Import-Csv -Path $CsvPath
     Write-StatusMessage "Loaded $($csvData.Count) operation(s) from CSV file." -Type Info
+    
+    # Start total script execution stopwatch
+    $totalScriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    
+    # Initialize arrays to store operation durations for summary
+    $exportDurations = @()
+    $importDurations = @()
+    $operationDurations = @()
 }
 
 Process {
@@ -34,6 +42,7 @@ Process {
         $operationId = $row.Operation_ID
         $databaseName = $row.Database_Name
         $operationStartTime = Get-Date
+        $operationStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         
         # Initialize operation-specific logging
         $logFile = Initialize-OperationLogging -OperationId $operationId -DatabaseName $databaseName -StartTime $operationStartTime -LogsFolder $LogsFolder
@@ -150,8 +159,8 @@ Process {
         if ($exportAction) {
             Write-StatusMessage "Starting Export Operation..." -Type Action -Indent 1
             Write-LogMessage -LogFile $logFile -Message "=== EXPORT OPERATION START ===" -Type Header
-            
-            $exportSuccess = Export-DatabaseOperation -Row $row -SqlPackagePath $SqlPackagePath -LogFile $logFile
+            $exportStartTime = Get-Date
+            $exportSuccess = Export-DatabaseOperation -Row $row -SqlPackagePath $SqlPackagePath -LogFile $logFile -StartTime $exportStartTime
             
             if (-not $exportSuccess) {
                 $message = "Export operation failed. Skipping import if enabled."
@@ -168,8 +177,8 @@ Process {
         if ($importAction) {
             Write-StatusMessage "Starting Import Operation..." -Type Action -Indent 1
             Write-LogMessage -LogFile $logFile -Message "=== IMPORT OPERATION START ===" -Type Header
-            
-            $importSuccess = Import-DatabaseOperation -Row $row -SqlPackagePath $SqlPackagePath -LogFile $logFile
+            $importStartTime = Get-Date
+            $importSuccess = Import-DatabaseOperation -Row $row -SqlPackagePath $SqlPackagePath -LogFile $logFile -StartTime $importStartTime
             
             if (-not $importSuccess) {
                 $message = "Import operation failed."
@@ -182,17 +191,59 @@ Process {
             Write-LogMessage -LogFile $logFile -Message "=== IMPORT OPERATION COMPLETED ===" -Type Header
         }
 
+        $operationStopwatch.Stop()
         $operationEndTime = Get-Date
-        $operationDuration = $operationEndTime - $operationStartTime
+        $operationDuration = New-TimeSpan -Start $operationStartTime -End $operationEndTime
+        $operationDurationFormatted = "{0:hh\:mm\:ss}" -f $operationDuration
         
-        Write-StatusMessage "Operation $operationId completed successfully." -Type Success
+        # Store operation duration for summary
+        $operationDurations += [PSCustomObject]@{
+            OperationId = $operationId
+            DatabaseName = $databaseName
+            Duration = $operationDuration
+        }
+        
+        Write-StatusMessage "Operation $operationId completed successfully in $operationDurationFormatted." -Type Success
         Write-LogMessage -LogFile $logFile -Message "Operation completed successfully." -Type Success
         Write-LogMessage -LogFile $logFile -Message "End Time: $($operationEndTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Type Info
-        Write-LogMessage -LogFile $logFile -Message "Total Duration: $($operationDuration.ToString('hh\:mm\:ss'))" -Type Info
+        Write-LogMessage -LogFile $logFile -Message "Total Duration: $operationDurationFormatted" -Type Info
         Write-LogMessage -LogFile $logFile -Message "=== OPERATION COMPLETED SUCCESSFULLY ===" -Type Header
     }
 }
 
 End {
+    $totalScriptStopwatch.Stop()
+    $totalScriptDuration = $totalScriptStopwatch.Elapsed
+    $totalScriptDurationFormatted = "{0:hh\:mm\:ss}" -f $totalScriptDuration
+    
     Write-StatusMessage "🎉 All database operations completed." -Type Success
+    Write-StatusMessage "=======================================================" -Type Header
+    Write-StatusMessage "Operation Summary" -Type Header
+    Write-StatusMessage "=======================================================" -Type Header
+    
+    # Calculate total export and import durations if applicable
+    # Note: Since we don't have direct access to export/import durations from the functions,
+    # we will summarize total operation durations instead.
+    if ($operationDurations.Count -gt 0) {
+        $totalOperationTime = New-Object System.TimeSpan
+        foreach ($op in $operationDurations) {
+            $totalOperationTime = $totalOperationTime.Add($op.Duration)
+        }
+        $totalOperationTimeFormatted = "{0:hh\:mm\:ss}" -f $totalOperationTime
+        
+        Write-StatusMessage "Total Operations Processed: $($operationDurations.Count)" -Type Info
+        Write-StatusMessage "Total Operation Time: $totalOperationTimeFormatted" -Type Info
+        
+        # List individual operation durations
+        Write-StatusMessage "Individual Operation Durations:" -Type Info
+        foreach ($op in $operationDurations) {
+            $opDurationFormatted = "{0:hh\:mm\:ss}" -f $op.Duration
+            Write-StatusMessage "  - Operation $($op.OperationId) ($($op.DatabaseName)): $opDurationFormatted" -Type Info
+        }
+    } else {
+        Write-StatusMessage "No operations were processed." -Type Warning
+    }
+    
+    Write-StatusMessage "Total Script Execution Time: $totalScriptDurationFormatted" -Type Info
+    Write-StatusMessage "=======================================================" -Type Header
 }

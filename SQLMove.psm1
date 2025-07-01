@@ -540,19 +540,23 @@ function Write-ImportSuccess {
         [string]$DatabaseName,
         [string]$ServerFQDN,
         [string]$Username,
-        [datetime]$StartTime = (Get-Date).AddMinutes(-2), # Default to 2 minutes ago if not provided
+        [datetime]$StartTime, # Start time must be provided
         [timespan]$Duration = [timespan]::Zero, # Default to zero if not provided
         [string]$LogFile
     )
+    
+    $endTime = Get-Date
+    $actualDuration = New-TimeSpan -Start $StartTime -End $endTime
+    $actualDurationFormatted = "{0:hh\:mm\:ss}" -f $actualDuration
     
     $successInfo = @(
         "Import completed successfully! 🎉"
         "Database: $DatabaseName"
         "Server: $ServerFQDN"
         "User: $Username"
-        "Total time: $($Duration.ToString('hh\:mm\:ss'))"
+        "Total time: $actualDurationFormatted"
         "Started: $($StartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-        "Completed: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+        "Completed: $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))"
     )
     
     foreach ($line in $successInfo) {
@@ -1267,9 +1271,12 @@ function Export-DatabaseOperation {
         [Parameter(Mandatory = $true)]
         [string]$SqlPackagePath,
         [Parameter(Mandatory = $false)]
-        [string]$LogFile
+        [string]$LogFile,
+        [Parameter(Mandatory = $false)]
+        [datetime]$StartTime
     )
     
+    $exportStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         Write-LogMessage -LogFile $LogFile -Message "Starting export database operation" -Type Action
         
@@ -1284,6 +1291,7 @@ function Export-DatabaseOperation {
         
         Write-StatusMessage "Using backup file: $backupFileName" -Type Info -Indent 2
         Write-LogMessage -LogFile $LogFile -Message "Using backup file: $backupFileName" -Type Info
+        
         
         # Export based on deployment type
         $exportSuccess = switch ($deploymentType) {
@@ -1334,13 +1342,22 @@ function Export-DatabaseOperation {
             return $false
         }
         
-        Write-StatusMessage "Export operation completed successfully" -Type Success -Indent 2
+        $exportStopwatch.Stop()
+        $exportEndTime = Get-Date
+        $exportDuration = if ($PSBoundParameters.ContainsKey('StartTime')) { New-TimeSpan -Start $StartTime -End $exportEndTime } else { $exportStopwatch.Elapsed }
+        $exportDurationFormatted = "{0:hh\:mm\:ss}" -f $exportDuration
+        Write-StatusMessage "Export operation completed successfully in $exportDurationFormatted" -Type Success -Indent 2
+        Write-LogMessage -LogFile $LogFile -Message "Export operation duration: $exportDurationFormatted" -Type Success
+        
         return $true
     }
     catch {
         Write-StatusMessage "Error in export operation: $($_.Exception.Message)" -Type Error -Indent 2
         Write-LogMessage -LogFile $LogFile -Message "Error in export operation: $($_.Exception.Message)" -Type Error
         return $false
+    }
+    finally {
+        $exportStopwatch.Stop()
     }
 }
 
@@ -2102,9 +2119,12 @@ function Import-DatabaseOperation {
         [Parameter(Mandatory = $true)]
         [string]$SqlPackagePath,
         [Parameter(Mandatory = $false)]
-        [string]$LogFile
+        [string]$LogFile,
+        [Parameter(Mandatory = $false)]
+        [datetime]$StartTime
     )
     
+    $importStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         Write-LogMessage -LogFile $LogFile -Message "Starting import database operation" -Type Action
         
@@ -2169,9 +2189,19 @@ function Import-DatabaseOperation {
             }
         }
 
-        if ($importSuccess -and [bool]::Parse($Row.Remove_Tempfile)) {
-            Remove-Item -Path $localBackupPath -Force
-            Write-StatusMessage "Cleaned up local file" -Type Info -Indent 2
+        $importStopwatch.Stop()
+        $importEndTime = Get-Date
+        $importDuration = if ($PSBoundParameters.ContainsKey('StartTime')) { New-TimeSpan -Start $StartTime -End $importEndTime } else { $importStopwatch.Elapsed }
+        $importDurationFormatted = "{0:hh\:mm\:ss}" -f $importDuration
+        
+        if ($importSuccess) {
+            Write-StatusMessage "Import operation completed successfully in $importDurationFormatted" -Type Success -Indent 2
+            Write-LogMessage -LogFile $LogFile -Message "Import operation duration: $importDurationFormatted" -Type Success
+            
+            if ([bool]::Parse($Row.Remove_Tempfile)) {
+                Remove-Item -Path $localBackupPath -Force
+                Write-StatusMessage "Cleaned up local file" -Type Info -Indent 2
+            }
         }
 
         return $importSuccess
@@ -2181,5 +2211,7 @@ function Import-DatabaseOperation {
         Write-LogMessage -LogFile $LogFile -Message "Error in import operation: $($_.Exception.Message)" -Type Error
         return $false
     }
+    finally {
+        $importStopwatch.Stop()
+    }
 }
-
