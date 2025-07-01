@@ -1,8 +1,8 @@
 -- ✅ STEP 0: Define parameters
 DECLARE @TargetDatabase NVARCHAR(128) = 'WideWorld';  -- 🔁 Replace with your actual target DB name
-DECLARE @CredentialName NVARCHAR(512) = 'https://sttransfers00allprodne.blob.core.windows.net/stct-transfers-00-all-prod-ne';
-DECLARE @SasToken NVARCHAR(MAX) = 'sv=2022-11-02&ss=bqf&srt=sco&sp=rwdlacup&se=2025-06-30T01:00:00Z&st=2025-06-23T00:00:00Z&spr=https&sig=6ocy%2FPvGu7nzs0BKJ7TMZ9%2BewGdtdHCMR4zqNwSUwRU%3D';
-DECLARE @BackupFileUrl NVARCHAR(MAX) = 'https://sttransfers00allprodne.blob.core.windows.net/stct-transfers-00-all-prod-ne/002_WideWorldImporters-Standard_20250627_123049.bak';
+DECLARE @CredentialName NVARCHAR(512) = 'https://<storage-account>.blob.core.windows.net/<container-name>';
+DECLARE @SasToken NVARCHAR(MAX) = '<your-sas-token>';
+DECLARE @BackupFileUrl NVARCHAR(MAX) = 'https://<storage-account>.blob.core.windows.net/<container-name>/<backup-file-name>.bak';
 
 -- ✅ STEP 1: Clean up credential name
 SET @CredentialName = RTRIM(LTRIM(@CredentialName));
