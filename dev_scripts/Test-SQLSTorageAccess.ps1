@@ -8,6 +8,7 @@
 
     The script performs the following steps:
     1.  Connects to the specified SQL Server from PowerShell and queries for server version, timestamp, and a list of databases.
+        It includes special error handling to detect common Azure SQL firewall issues.
     2.  Uploads this rich proof data to a new, unique file in the specified blob container.
     3.  Connects to SQL Server again and creates a temporary credential based on the chosen authentication method.
     4.  Executes a SELECT query from within SQL using OPENROWSET to read the content of the proof file.
@@ -48,9 +49,6 @@
 .EXAMPLE
     # Test using a SAS Token loaded from the default 'sastoken' file
     PS C:\> .\Test-SQLSTorageAccess.ps1 -Database 'MyUserDB' -StorageAccountName 'mystorage' -StorageContainerName 'mycontainer' -AuthMethod SASToken
-
-    # Test using a Storage Access Key provided directly, and remove the proof file
-    PS C:\> .\Test-SQLSTorageAccess.ps1 -Database 'MyUserDB' -StorageAccountName 'mystorage' -StorageContainerName 'mycontainer' -AuthMethod StorageKey -StorageAccessKey 'YourKey...' -RemoveProofFile
 #>
 [CmdletBinding()]
 param(
@@ -115,8 +113,7 @@ if ($AuthMethod -eq 'SASToken') {
     $credentialIdentity = 'SHARED ACCESS SIGNATURE'
     $credentialSecret = $SASToken
 }
-else {
-    # StorageKey
+else { # StorageKey
     if ([string]::IsNullOrEmpty($StorageAccessKey)) {
         throw "AuthMethod is 'StorageKey' but no Storage Access Key was provided or found in the 'storageaccesskey' file."
     }
@@ -128,7 +125,8 @@ else {
 
 # Temporary object names
 $credentialName = "https://$StorageAccountName.blob.core.windows.net/$StorageContainerName"
-$proofFileName = "sql-read-proof-$(Get-Date -Format 'yyyyMMddHHmmss').txt"
+$serverRootName = ($SqlServer.Split('.'))[0]
+$proofFileName = "sql-read-proof_$($serverRootName)_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
 $localProofFilePath = Join-Path -Path $env:TEMP -ChildPath $proofFileName
 
 # SQL Connection parameters
@@ -146,8 +144,8 @@ Write-Host "------------------------------------------------------------"
 Write-Host "CONFIGURATION"
 Write-Host "------------------------------------------------------------"
 Write-Host "🎯 SQL Server          : $SqlServer"
-Write-Host "�� Database            : $Database"
-Write-Host "�� User                : $Username"
+Write-Host "💾 Database            : $Database"
+Write-Host "👤 User                : $Username"
 Write-Host "📦 Storage Account     : $StorageAccountName"
 Write-Host "📥 Container           : $StorageContainerName"
 Write-Host "🔐 Auth Method         : $AuthMethod"
@@ -174,7 +172,18 @@ UNION ALL
 SELECT 5, name FROM sys.databases
 ORDER BY SortKey, Info;
 "@
-    $proofData = Invoke-Sqlcmd @sqlParams -Query $proofQuery
+    try {
+        $proofData = Invoke-Sqlcmd @sqlParams -Query $proofQuery
+    }
+    catch {
+        if ($_.Exception.GetBaseException().Message -like "*Connection Timeout Expired*") {
+            Write-Host "`n🔥 A connection timeout occurred. This is common with Azure SQL Database." -ForegroundColor Yellow
+            Write-Host "   ACTION REQUIRED: In the Azure Portal, go to the Firewall settings for your" -ForegroundColor Yellow
+            Write-Host "   SQL Server ('$SqlServer') and ensure 'Allow Azure services and resources to access this server' is ENABLED." -ForegroundColor Yellow
+        }
+        # Re-throw the original exception to be caught by the main handler
+        throw
+    }
     $proofPayload = ($proofData.Info | Out-String).Trim()
     $proofPayload | Out-File -FilePath $localProofFilePath -Force
     Write-Host " ✅ Success!"
@@ -194,8 +203,7 @@ ORDER BY SortKey, Info;
         $createMasterKeySql = "CREATE MASTER KEY ENCRYPTION BY PASSWORD = '$(New-Guid)';"
         Invoke-Sqlcmd @sqlParams -Query $createMasterKeySql -ErrorAction Stop
         Write-Host " ✅ Success!"
-    }
-    else {
+    } else {
         Write-Host " ✅ Found."
     }
 
@@ -230,13 +238,13 @@ ORDER BY SortKey, Info;
     Write-Host ""
 }
 catch {
-    Write-Host " ❌ FAILED!" -ForegroundColor Red
+    Write-Host "`n ❌ FAILED!" -ForegroundColor Red
     Write-Host "🔥 Error: $($_.Exception.GetBaseException().Message)" -ForegroundColor Red
     exit 1
 }
 finally {
     # 6. Cleanup
-    Write-Host "🧹 Starting cleanup..."
+    Write-Host "`n🧹 Starting cleanup..."
     if ($credentialCreated) {
         Write-Host "➡️  Dropping credential..." -NoNewline
         try {
@@ -258,8 +266,7 @@ finally {
             catch {
                 Write-Host " ❌ FAILED to delete proof file!" -ForegroundColor Yellow
             }
-        }
-        else {
+        } else {
             Write-Host "➡️  Proof file '$proofFileName' was left in the container." -ForegroundColor Cyan
         }
     }
