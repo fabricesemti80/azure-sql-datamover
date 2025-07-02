@@ -1,3 +1,5 @@
 input*
 logs*
 dev_scripts/sqlpassword
+dev_scripts/sastoken
+dev_scripts/storageaccesskey
