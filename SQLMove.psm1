@@ -329,58 +329,6 @@ function Test-DiskSpace {
     }
 }
 
-function Test-SqlServerAccess {
-    [CmdletBinding()]
-    param(
-        [string]$ServerFQDN,
-        [string]$DatabaseName,
-        [string]$Username,
-        [string]$Password,
-        [string]$Operation,
-        [string]$LogFile
-    )
-    
-    try {
-        $message = "Testing $Operation SQL Server access: $ServerFQDN"
-        Write-StatusMessage $message -Type Info -Indent 2
-        Write-LogMessage -LogFile $LogFile -Message $message -Type Info
-        
-        # Use longer timeout for complex connections
-        $timeout = 60
-        $connectionString = "Server=$ServerFQDN;Database=master;User Id=$Username;Password=$Password;Connection Timeout=$timeout;Encrypt=True;TrustServerCertificate=False;"
-        
-        try {
-            Add-Type -AssemblyName System.Data
-            $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
-            $connection.Open()
-            
-            # Test if we can access the specific database
-            $command = $connection.CreateCommand()
-            $command.CommandText = "SELECT name FROM sys.databases WHERE name = @dbname"
-            $command.Parameters.AddWithValue("@dbname", $DatabaseName)
-            $result = $command.ExecuteScalar()
-            
-            $connection.Close()
-            
-            $successMessage = "$Operation server '$ServerFQDN' is accessible"
-            Write-StatusMessage $successMessage -Type Success -Indent 3
-            Write-LogMessage -LogFile $LogFile -Message $successMessage -Type Success
-            return $true
-        }
-        catch {
-            $errorMessage = "Cannot connect to $Operation server '$ServerFQDN': $($_.Exception.Message)"
-            Write-StatusMessage $errorMessage -Type Error -Indent 3
-            Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-            return $false
-        }
-    }
-    catch {
-        $errorMessage = "Error testing $Operation server access: $_"
-        Write-StatusMessage $errorMessage -Type Error -Indent 2
-        Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-        return $false
-    }
-}
 
 
 function Test-StorageAccess {
@@ -961,6 +909,64 @@ function Get-BackupFileInfo {
 #                                                                                           Export functions                                                                                           #
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- #
 
+function Invoke-SqlPackage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$ArgumentList,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SqlPackagePath,
+
+        [Parameter(Mandatory = $false)]
+        [string]$LogFile,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ProgressMessage = "Processing with SqlPackage..."
+    )
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $outputFile = [System.IO.Path]::GetTempFileName()
+    $errorFile = "$outputFile.err"
+
+    try {
+        $process = Start-Process -FilePath $SqlPackagePath -ArgumentList $ArgumentList -NoNewWindow -PassThru -RedirectStandardOutput $outputFile -RedirectStandardError $errorFile
+        
+        Show-OperationProgress -Operation $ProgressMessage -Stopwatch $stopwatch -LogFile $LogFile -ProgressCheck { $process.HasExited }
+        
+        $stopwatch.Stop()
+
+        if ($process.ExitCode -ne 0) {
+            $errorMessage = "SqlPackage operation failed with exit code $($process.ExitCode)."
+            Write-OperationStatus -Message $errorMessage -Type Error -Indent 3 -LogFile $LogFile
+            
+            if (Test-Path $errorFile) {
+                $errorContent = Get-Content $errorFile
+                if ($errorContent) {
+                    Write-OperationStatus -Message "Error details:" -Type Error -Indent 4 -LogFile $LogFile
+                    $errorContent | ForEach-Object {
+                        Write-OperationStatus -Message $_ -Type Error -Indent 5 -LogFile $LogFile
+                    }
+                }
+            }
+            return $false
+        }
+
+        $totalTimeFormatted = "{0:hh\:mm\:ss}" -f $stopwatch.Elapsed
+        $successMessage = "SqlPackage operation completed successfully in $totalTimeFormatted."
+        Write-OperationStatus -Message $successMessage -Type Success -Indent 3 -LogFile $LogFile
+        return $true
+    }
+    catch {
+        Write-OperationStatus -Message "Error invoking SqlPackage: $($_.Exception.Message)" -Type Error -Indent 3 -LogFile $LogFile
+        return $false
+    }
+    finally {
+        if (Test-Path $outputFile) { Remove-Item $outputFile -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $errorFile) { Remove-Item $errorFile -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Export-SqlDatabaseToBacpac {
     [CmdletBinding()]
     param(
@@ -973,107 +979,31 @@ function Export-SqlDatabaseToBacpac {
         [string]$LogFile
     )
     
-    try {
-        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        $startTime = Get-Date
-        
-        $message = "Starting BACPAC export from '$DatabaseName' on '$ServerFQDN'..."
-        Write-StatusMessage $message -Type Action -Indent 3
-        Write-LogMessage -LogFile $LogFile -Message $message -Type Action
-        
-        $exportArgs = @(
-            "/Action:Export",
-            "/SourceServerName:$ServerFQDN",
-            "/SourceDatabaseName:$DatabaseName",
-            "/SourceUser:$Username",
-            "/SourcePassword:$Password",
-            "/TargetFile:$OutputPath",
-            "/p:VerifyExtraction=false",
-            "/p:Storage=Memory",
-            "/p:CommandTimeout=0"
-             
-        )
-        
-        Write-LogMessage -LogFile $LogFile -Message "SqlPackage arguments: $($exportArgs -join ' ')" -Type Info
-        
-        $outputFile = [System.IO.Path]::GetTempFileName()
-        $process = Start-Process -FilePath $SqlPackagePath -ArgumentList $exportArgs -NoNewWindow -PassThru -RedirectStandardOutput $outputFile -RedirectStandardError "$outputFile.err"
-        
-        # Progress monitoring
-        $spinChars = '|', '/', '-', '\'
-        $spinIndex = 0
-        $lastProgressTime = [DateTime]::Now
-        $progressInterval = [TimeSpan]::FromSeconds(10)
-        
-        while (-not $process.HasExited) {
-            $spinChar = $spinChars[$spinIndex]
-            $spinIndex = ($spinIndex + 1) % $spinChars.Length
-            $elapsedTime = $stopwatch.Elapsed
-            $elapsedFormatted = "{0:hh\:mm\:ss}" -f $elapsedTime
-            
-            # Log progress every 10 seconds
-            if (([DateTime]::Now - $lastProgressTime) -ge $progressInterval) {
-                Write-LogMessage -LogFile $LogFile -Message "Export in progress... Elapsed: $elapsedFormatted" -Type Info
-                $lastProgressTime = [DateTime]::Now
-            }
-            
-            Write-Host "`r      $spinChar Exporting database... Time elapsed: $elapsedFormatted" -NoNewline
-            Start-Sleep -Milliseconds 250
-        }
-        
-        Write-Host "`r                                                                    " -NoNewline
-        $stopwatch.Stop()
-        
-        if ($process.ExitCode -eq 0) {
-            $totalTime = $stopwatch.Elapsed
-            $totalTimeFormatted = "{0:hh\:mm\:ss}" -f $totalTime
-            $successMessage = "Export completed successfully in $totalTimeFormatted"
-            Write-StatusMessage $successMessage -Type Success -Indent 3
-            Write-LogMessage -LogFile $LogFile -Message $successMessage -Type Success
-            
-            if (Test-Path $OutputPath) {
-                $fileInfo = Get-Item $OutputPath
-                $fileSizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
-                $sizeMessage = "BACPAC file size: $fileSizeMB MB"
-                Write-StatusMessage $sizeMessage -Type Success -Indent 4
-                Write-LogMessage -LogFile $LogFile -Message $sizeMessage -Type Success
-            }
-            
-            return $true
-        }
-        else {
-            $errorMessage = "Export failed with exit code $($process.ExitCode)"
-            Write-StatusMessage $errorMessage -Type Error -Indent 3
-            Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-            
-            if (Test-Path "$outputFile.err") {
-                $errorContent = Get-Content "$outputFile.err"
-                if ($errorContent) {
-                    Write-StatusMessage "Error details:" -Type Error -Indent 4
-                    Write-LogMessage -LogFile $LogFile -Message "Error details:" -Type Error
-                    $errorContent | ForEach-Object {
-                        Write-StatusMessage "$_" -Type Error -Indent 5
-                        Write-LogMessage -LogFile $LogFile -Message "$_" -Type Error
-                    }
-                }
-            }
-            return $false
-        }
+    $message = "Starting BACPAC export from '$DatabaseName' on '$ServerFQDN'..."
+    Write-OperationStatus -Message $message -Type Action -Indent 3 -LogFile $LogFile
+    
+    $exportArgs = @(
+        "/Action:Export",
+        "/SourceServerName:$ServerFQDN",
+        "/SourceDatabaseName:$DatabaseName",
+        "/SourceUser:$Username",
+        "/SourcePassword:$Password",
+        "/TargetFile:$OutputPath",
+        "/p:VerifyExtraction=false",
+        "/p:Storage=Memory",
+        "/p:CommandTimeout=0"
+    )
+    
+    $success = Invoke-SqlPackage -ArgumentList $exportArgs -SqlPackagePath $SqlPackagePath -LogFile $LogFile -ProgressMessage "Exporting BACPAC"
+    
+    if ($success -and (Test-Path $OutputPath)) {
+        $fileInfo = Get-Item $OutputPath
+        $fileSizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
+        $sizeMessage = "BACPAC file size: $fileSizeMB MB"
+        Write-OperationStatus -Message $sizeMessage -Type Success -Indent 4 -LogFile $LogFile
     }
-    catch {
-        $errorMessage = "Error during export: $($_.Exception.Message)"
-        Write-StatusMessage $errorMessage -Type Error -Indent 3
-        Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-        return $false
-    }
-    finally {
-        # Cleanup
-        try {
-            if (Test-Path $outputFile -ErrorAction SilentlyContinue) { Remove-Item $outputFile -ErrorAction SilentlyContinue }
-            if (Test-Path "$outputFile.err" -ErrorAction SilentlyContinue) { Remove-Item "$outputFile.err" -ErrorAction SilentlyContinue }
-        }
-        catch {}
-    }
+    
+    return $success
 }
 
 function Export-SqlDatabaseToBak {
@@ -1515,24 +1445,16 @@ function Import-BacpacToSqlManagedInstance {
         [string]$LogFile
     )
     
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $startTime = Get-Date
     
     try {
         # First, check and drop existing database
-        $connectionString = "Server=$ServerFQDN;Database=master;User Id=$Username;Password=$Password;Encrypt=True;TrustServerCertificate=False;"
-        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $connection = New-SqlConnection -ServerFQDN $ServerFQDN -Username $Username -Password $Password
         $connection.Open()
 
         Write-OperationStatus "Checking for existing database..." -Type Info -Indent 3 -LogFile $LogFile
 
-        # Drop database if exists
-        $dropSQL = @"
-IF EXISTS (SELECT * FROM sys.databases WHERE name = '$DatabaseName')
-BEGIN
-    DROP DATABASE [$DatabaseName];
-END
-"@
+        $dropSQL = "IF EXISTS (SELECT * FROM sys.databases WHERE name = '$DatabaseName') BEGIN DROP DATABASE [$DatabaseName]; END"
         $command = $connection.CreateCommand()
         $command.CommandText = $dropSQL
         $command.CommandTimeout = 300
@@ -1543,36 +1465,22 @@ END
 
         # Proceed with import
         $importArgs = @(
-            "/action:Import"
-            "/SourceFile:$BacpacSource"
-            "/TargetServerName:$ServerFQDN"
-            "/TargetDatabaseName:$DatabaseName"
-            "/TargetUser:$Username"
-            "/TargetPassword:$Password"
+            "/action:Import",
+            "/SourceFile:$BacpacSource",
+            "/TargetServerName:$ServerFQDN",
+            "/TargetDatabaseName:$DatabaseName",
+            "/TargetUser:$Username",
+            "/TargetPassword:$Password",
             "/p:CommandTimeout=3600"
         )
         
-        Write-OperationStatus "Starting BACPAC import to MI '$DatabaseName' on '$ServerFQDN'..." -Type Action -Indent 3 -LogFile $LogFile
+        $success = Invoke-SqlPackage -ArgumentList $importArgs -SqlPackagePath $SqlPackagePath -LogFile $LogFile -ProgressMessage "Importing BACPAC to MI"
         
-        $process = Start-Process -FilePath $SqlPackagePath -ArgumentList $importArgs -NoNewWindow -PassThru
-        
-        Show-OperationProgress -Operation "Importing BACPAC to MI" -Stopwatch $stopwatch -LogFile $LogFile -ProgressCheck {
-            $process.HasExited
+        if ($success) {
+            Write-ImportSuccess -DatabaseName $DatabaseName -ServerFQDN $ServerFQDN -Username $Username -StartTime $startTime -LogFile $LogFile
         }
         
-        if ($process.ExitCode -eq 0) {
-            $stopwatch.Stop()
-            Write-ImportSuccess -DatabaseName $DatabaseName `
-                -ServerFQDN $ServerFQDN `
-                -Username $Username `
-                -StartTime $startTime `
-                -Duration $stopwatch.Elapsed `
-                -LogFile $LogFile
-            return $true
-        }
-        
-        Write-OperationStatus "MI Import failed with exit code $($process.ExitCode)" -Type Error -Indent 3 -LogFile $LogFile
-        return $false
+        return $success
     }
     catch {
         Write-OperationStatus "Error during MI import: $($_.Exception.Message)" -Type Error -Indent 3 -LogFile $LogFile
