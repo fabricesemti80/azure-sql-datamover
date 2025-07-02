@@ -84,49 +84,121 @@ param(
     [switch]$RemoveProofFile
 )
 
+#region Helper Functions
+
+function Write-Status {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        [Parameter(Mandatory = $false)]
+        [string]$Type = "Info", # Can be "Info", "Success", "Warning", "Error"
+        [Parameter(Mandatory = $false)]
+        [switch]$NoNewline
+    )
+    $color = switch ($Type) {
+        "Success" { "Green" }
+        "Warning" { "Yellow" }
+        "Error" { "Red" }
+        Default { "White" }
+    }
+    $prefix = switch ($Type) {
+        "Success" { "✅" }
+        "Warning" { "⚠️" }
+        "Error" { "🔥" }
+        Default { "➡️" }
+    }
+    Write-Host "$prefix  $Message" -ForegroundColor $color -NoNewline:$NoNewline
+}
+
+function Ensure-Module {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ModuleName
+    )
+    try {
+        if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+            Write-Status -Message "'$ModuleName' module not found. Attempting to install..." -Type "Warning"
+            Install-Module -Name $ModuleName -Scope CurrentUser -Repository PSGallery -Force -AllowClobber -ErrorAction Stop
+        }
+        Import-Module $ModuleName -ErrorAction Stop
+        Write-Status -Message "'$ModuleName' module is ready." -Type "Success"
+        return $true
+    }
+    catch {
+        Write-Status -Message "Critical Error: Failed to load required PowerShell module '$ModuleName'. $($_.Exception.Message)" -Type "Error"
+        return $false
+    }
+}
+
+function Invoke-SqlcmdSafe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$SqlParams,
+        [Parameter(Mandatory = $true)]
+        [string]$Query,
+        [Parameter(Mandatory = $false)]
+        [string]$OperationName = "SQL operation",
+        [Parameter(Mandatory = $false)]
+        [string]$ConnectionTimeoutMessage = "A connection timeout occurred. This is common with Azure SQL Database. ACTION REQUIRED: In the Azure Portal, go to the Firewall settings for your SQL Server ('$($SqlParams.ServerInstance)') and ensure 'Allow Azure services and resources to access this server' is ENABLED."
+    )
+    try {
+        Write-Status -Message "$OperationName : " -NoNewline
+        $result = Invoke-Sqlcmd @SqlParams -Query $Query -ErrorAction Stop
+        Write-Status -Message " Success!" -Type "Success"
+        return $result
+    }
+    catch {
+        if ($_.Exception.GetBaseException().Message -like "*Connection Timeout Expired*") {
+            Write-Status -Message "`n$ConnectionTimeoutMessage" -Type "Warning"
+        }
+        Write-Status -Message "`nError during $OperationName : $($_.Exception.GetBaseException().Message)" -Type "Error"
+        throw $_ # Re-throw to be caught by the main handler
+    }
+}
+
+#endregion
+
 #region Module Checks
-try {
-    if (-not (Get-Module -ListAvailable -Name SqlServer)) {
-        Write-Host "🔧 'SqlServer' module not found. Attempting to install..." -ForegroundColor Yellow
-        Install-Module -Name SqlServer -Scope CurrentUser -Repository PSGallery -Force -AllowClobber
-    }
-    if (-not (Get-Module -ListAvailable -Name Az.Storage)) {
-        Write-Host "🔧 'Az.Storage' module not found. Attempting to install..." -ForegroundColor Yellow
-        Install-Module -Name Az.Storage -Scope CurrentUser -Repository PSGallery -Force -AllowClobber
-    }
-    Import-Module SqlServer -ErrorAction Stop
-    Import-Module Az.Storage -ErrorAction Stop
-    Write-Host "✅ Required PowerShell modules are ready." -ForegroundColor Green
-}
-catch {
-    Write-Host "🔥 Critical Error: Failed to load required PowerShell modules." -ForegroundColor Red
-    exit 1
-}
+if (-not (Ensure-Module -ModuleName SqlServer)) { exit 1 }
+if (-not (Ensure-Module -ModuleName Az.Storage)) { exit 1 }
+Write-Status -Message "Required PowerShell modules are ready." -Type "Success"
 #endregion
 
 #region Validate Parameters and Create Storage Context
-if ($AuthMethod -eq 'SASToken') {
-    if ([string]::IsNullOrEmpty($SASToken)) {
-        throw "AuthMethod is 'SASToken' but no SAS Token was provided or found in the 'sastoken' file."
+$credentialIdentity = ""
+$credentialSecret = ""
+$pre = ""
+$storageContext = $null
+
+switch ($AuthMethod) {
+    'SASToken' {
+        if ([string]::IsNullOrEmpty($SASToken)) {
+            throw "AuthMethod is 'SASToken' but no SAS Token was provided or found in the 'sastoken' file."
+        }
+        $storageContext = New-AzStorageContext -StorageAccountName $StorageAccountName -SasToken $SASToken
+        $credentialIdentity = 'SHARED ACCESS SIGNATURE'
+        $credentialSecret = $SASToken
+        $pre = "SAS"
     }
-    $storageContext = New-AzStorageContext -StorageAccountName $StorageAccountName -SasToken $SASToken
-    $credentialIdentity = 'SHARED ACCESS SIGNATURE'
-    $credentialSecret = $SASToken
-}
-else { # StorageKey
-    if ([string]::IsNullOrEmpty($StorageAccessKey)) {
-        throw "AuthMethod is 'StorageKey' but no Storage Access Key was provided or found in the 'storageaccesskey' file."
+    'StorageKey' {
+        if ([string]::IsNullOrEmpty($StorageAccessKey)) {
+            throw "AuthMethod is 'StorageKey' but no Storage Access Key was provided or found in the 'storageaccesskey' file."
+        }
+        $storageContext = New-AzStorageContext -StorageAccountName $StorageAccountName -StorageAccountKey $StorageAccessKey
+        $credentialIdentity = 'Storage Account Key'
+        $credentialSecret = $StorageAccessKey
+        $pre = "KEY"
     }
-    $storageContext = New-AzStorageContext -StorageAccountName $StorageAccountName -StorageAccountKey $StorageAccessKey
-    $credentialIdentity = 'Storage Account Key'
-    $credentialSecret = $StorageAccessKey
+    Default {
+        throw "Invalid AuthMethod specified: $AuthMethod"
+    }
 }
 #endregion
 
 # Temporary object names
 $credentialName = "https://$StorageAccountName.blob.core.windows.net/$StorageContainerName"
 $serverRootName = ($SqlServer.Split('.'))[0]
-$proofFileName = "sql-read-proof_$($serverRootName)_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
+$proofFileName = "$pre-sql-read-proof_$($serverRootName)_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
 $localProofFilePath = Join-Path -Path $env:TEMP -ChildPath $proofFileName
 
 # SQL Connection parameters
@@ -143,12 +215,12 @@ Write-Host "`n🧪 Starting Definitive SQL Read-Back Test..."
 Write-Host "------------------------------------------------------------"
 Write-Host "CONFIGURATION"
 Write-Host "------------------------------------------------------------"
-Write-Host "🎯 SQL Server          : $SqlServer"
-Write-Host "💾 Database            : $Database"
-Write-Host "👤 User                : $Username"
-Write-Host "📦 Storage Account     : $StorageAccountName"
-Write-Host "📥 Container           : $StorageContainerName"
-Write-Host "🔐 Auth Method         : $AuthMethod"
+Write-Host "🎯 SQL Server          : $($SqlServer)"
+Write-Host "💾 Database            : $($Database)"
+Write-Host "👤 User                : $($Username)"
+Write-Host "📦 Storage Account     : $($StorageAccountName)"
+Write-Host "📥 Container           : $($StorageContainerName)"
+Write-Host "🔐 Auth Method         : $($AuthMethod)"
 Write-Host "🗑️ Remove Proof File   : $($RemoveProofFile.IsPresent)"
 Write-Host "------------------------------------------------------------"
 Write-Host "EXECUTION"
@@ -159,7 +231,6 @@ $proofFileUploaded = $false
 
 try {
     # 1. Query SQL for the proof payload
-    Write-Host "➡️  Querying SQL Server for proof data..." -NoNewline
     $proofQuery = @"
 SELECT 1 AS SortKey, '--- SQL Server Proof of Access ---' AS Info
 UNION ALL
@@ -172,64 +243,77 @@ UNION ALL
 SELECT 5, name FROM sys.databases
 ORDER BY SortKey, Info;
 "@
-    try {
-        $proofData = Invoke-Sqlcmd @sqlParams -Query $proofQuery
-    }
-    catch {
-        if ($_.Exception.GetBaseException().Message -like "*Connection Timeout Expired*") {
-            Write-Host "`n🔥 A connection timeout occurred. This is common with Azure SQL Database." -ForegroundColor Yellow
-            Write-Host "   ACTION REQUIRED: In the Azure Portal, go to the Firewall settings for your" -ForegroundColor Yellow
-            Write-Host "   SQL Server ('$SqlServer') and ensure 'Allow Azure services and resources to access this server' is ENABLED." -ForegroundColor Yellow
-        }
-        # Re-throw the original exception to be caught by the main handler
-        throw
-    }
+    $proofData = Invoke-SqlcmdSafe -SqlParams $sqlParams -Query $proofQuery -OperationName "Querying SQL Server for proof data"
     $proofPayload = ($proofData.Info | Out-String).Trim()
     $proofPayload | Out-File -FilePath $localProofFilePath -Force
-    Write-Host " ✅ Success!"
 
     # 2. Upload the proof file to the storage container
-    Write-Host "➡️  Uploading proof file '$proofFileName'..." -NoNewline
-    Set-AzStorageBlobContent -Context $storageContext -Container $StorageContainerName -File $localProofFilePath -Blob $proofFileName -Force | Out-Null
-    $proofFileUploaded = $true
-    Write-Host " ✅ Success!"
+    try {
+        Write-Status -Message ("Uploading proof file '$proofFileName'" + ": ") -NoNewline
+        Set-AzStorageBlobContent -Context $storageContext -Container $StorageContainerName -File $localProofFilePath -Blob $proofFileName -Force | Out-Null
+        $proofFileUploaded = $true
+        Write-Status -Message " Success!" -Type "Success"
+    }
+    catch {
+        $baseException = $_.Exception.GetBaseException()
+        if ($baseException.Message -like "*Server failed to authenticate the request*") {
+            Write-Status -Message "`nFailed to upload proof file. This indicates an authentication issue with your Azure Storage Account. Please verify the Storage Account Name, Container Name, and ensure the provided SAS Token or Access Key is correct and has the necessary permissions (e.g., 'Write' for SAS Token, or a valid Storage Access Key)." -Type "Error"
+        }
+        else {
+            Write-Status -Message "`nFailed to upload proof file: $($baseException.Message)" -Type "Error"
+        }
+        throw $_ # Re-throw to be caught by the main handler
+    }
 
     # 3. Ensure Database Master Key exists
-    Write-Host "➡️  Checking for database master key..." -NoNewline
     $checkMasterKeySql = "SELECT COUNT(*) FROM sys.symmetric_keys WHERE name = '##MS_DatabaseMasterKey##';"
-    $masterKeyExists = Invoke-Sqlcmd @sqlParams -Query $checkMasterKeySql
+    $masterKeyExists = Invoke-SqlcmdSafe -SqlParams $sqlParams -Query $checkMasterKeySql -OperationName "Checking for database master key"
     if ($masterKeyExists.Column1 -eq 0) {
-        Write-Host " 🔑 Not found. Creating one..."
+        Write-Status -Message " 🔑 Not found. Creating one..."
         $createMasterKeySql = "CREATE MASTER KEY ENCRYPTION BY PASSWORD = '$(New-Guid)';"
-        Invoke-Sqlcmd @sqlParams -Query $createMasterKeySql -ErrorAction Stop
-        Write-Host " ✅ Success!"
-    } else {
-        Write-Host " ✅ Found."
+        Invoke-SqlcmdSafe -SqlParams $sqlParams -Query $createMasterKeySql -OperationName "Creating database master key"
+    }
+    else {
+        Write-Status -Message " ✅ Found." -Type "Success"
     }
 
     # 4. Create the Database Scoped Credential
-    Write-Host "➡️  Creating credential for '$($credentialName.Split('?')[0])'..." -NoNewline
     $credentialSql = "CREATE DATABASE SCOPED CREDENTIAL [$credentialName] WITH IDENTITY = '$credentialIdentity', SECRET = '$credentialSecret';"
     $fullCredentialSql = "
         IF NOT EXISTS (SELECT 1 FROM sys.database_scoped_credentials WHERE name = '$credentialName')
         BEGIN
             $credentialSql
         END"
-    Invoke-Sqlcmd @sqlParams -Query $fullCredentialSql -QueryTimeout 60 -ErrorAction Stop
+    Invoke-SqlcmdSafe -SqlParams $sqlParams -Query $fullCredentialSql -OperationName "Creating credential for '$($credentialName.Split('?')[0])'" -ConnectionTimeoutMessage "A connection timeout occurred. This is common with Azure SQL Database. ACTION REQUIRED: In the Azure Portal, go to the Firewall settings for your SQL Server ('$($SqlParams.ServerInstance)') and ensure 'Allow Azure services and resources to access this server' is ENABLED."
     $credentialCreated = $true
-    Write-Host " ✅ Success!"
 
     # 5. Actively test the connection by reading the uploaded file from SQL
-    Write-Host "➡️  Attempting to read proof file FROM SQL..." -NoNewline
-    $fullBlobPath = "https://$StorageAccountName.blob.core.windows.net/$StorageContainerName/$proofFileName"
-    $testQuery = "SELECT BulkColumn FROM OPENROWSET(BULK '$fullBlobPath', SINGLE_CLOB) as t;"
-    $fileContentFromSql = Invoke-Sqlcmd @sqlParams -Query $testQuery -ErrorAction Stop
-    Write-Host " ✅ Read successful!"
-    Write-Host ""
-    Write-Host "------------------- Proof File Content (Read by SQL) --------------------" -ForegroundColor Cyan
-    Write-Host $fileContentFromSql.BulkColumn -ForegroundColor Cyan
-    Write-Host "-----------------------------------------------------------------------" -ForegroundColor Cyan
-    Write-Host ""
+    # Only attempt to read from SQL if the file was successfully uploaded
+    if ($proofFileUploaded) {
+        $fullBlobPath = "https://$StorageAccountName.blob.core.windows.net/$StorageContainerName/$proofFileName"
+        $testQuery = "SELECT BulkColumn FROM OPENROWSET(BULK '$fullBlobPath', SINGLE_CLOB) as t;"
+        try {
+            $fileContentFromSql = Invoke-SqlcmdSafe -SqlParams $sqlParams -Query $testQuery -OperationName "Attempting to read proof file FROM SQL"
+            Write-Host ""
+            Write-Host "------------------- Proof File Content (Read by SQL) --------------------" -ForegroundColor Cyan
+            Write-Host $fileContentFromSql.BulkColumn -ForegroundColor Cyan
+            Write-Host "-----------------------------------------------------------------------" -ForegroundColor Cyan
+            Write-Host ""
+        }
+        catch {
+            $baseException = $_.Exception.GetBaseException()
+            if ($baseException.Message -like "*Cannot find the CREDENTIAL*" -or $baseException.Message -like "*Access denied*") {
+                Write-Status -Message "`nFailed to read proof file from SQL. This usually means SQL Server cannot access the storage account, even if the credential was created. Please ensure the SQL Server's managed identity or IP address is allowed access to the storage account, and the credential's secret is correct." -Type "Error"
+            }
+            else {
+                Write-Status -Message "`nFailed to read proof file from SQL: $($baseException.Message)" -Type "Error"
+            }
+            throw $_ # Re-throw to be caught by the main handler
+        }
+    }
+    else {
+        Write-Status -Message "Skipping SQL read-back test because the proof file upload failed." -Type "Warning"
+    }
 
     Write-Host "🎉" -ForegroundColor Green
     Write-Host "--------------------------------------------------------------------" -ForegroundColor Green
@@ -238,36 +322,36 @@ ORDER BY SortKey, Info;
     Write-Host ""
 }
 catch {
-    Write-Host "`n ❌ FAILED!" -ForegroundColor Red
-    Write-Host "🔥 Error: $($_.Exception.GetBaseException().Message)" -ForegroundColor Red
+    Write-Status -Message "FAILED! Error: $($_.Exception.GetBaseException().Message)" -Type "Error"
     exit 1
 }
 finally {
     # 6. Cleanup
     Write-Host "`n🧹 Starting cleanup..."
     if ($credentialCreated) {
-        Write-Host "➡️  Dropping credential..." -NoNewline
+        Write-Status -Message "Dropping credential..." -NoNewline
         try {
             $dropCredentialSql = "DROP DATABASE SCOPED CREDENTIAL [$credentialName];"
             Invoke-Sqlcmd @sqlParams -Query $dropCredentialSql -QueryTimeout 60 -ErrorAction Stop
-            Write-Host " ✅ Dropped!"
+            Write-Status -Message " Dropped!" -Type "Success"
         }
         catch {
-            Write-Host " ❌ FAILED to drop credential!" -ForegroundColor Red
+            Write-Status -Message "FAILED to drop credential!" -Type "Error"
         }
     }
     if ($proofFileUploaded) {
         if ($RemoveProofFile) {
-            Write-Host "➡️  Deleting proof file '$proofFileName' as requested..." -NoNewline
+            Write-Status -Message "Deleting proof file '$proofFileName' as requested..." -NoNewline
             try {
                 Remove-AzStorageBlob -Context $storageContext -Container $StorageContainerName -Blob $proofFileName -Force | Out-Null
-                Write-Host " ✅ Deleted!"
+                Write-Status -Message " Deleted!" -Type "Success"
             }
             catch {
-                Write-Host " ❌ FAILED to delete proof file!" -ForegroundColor Yellow
+                Write-Status -Message "FAILED to delete proof file!" -Type "Warning"
             }
-        } else {
-            Write-Host "➡️  Proof file '$proofFileName' was left in the container." -ForegroundColor Cyan
+        }
+        else {
+            Write-Status -Message "Proof file '$proofFileName' was left in the container." -Type "Info"
         }
     }
     if (Test-Path -Path $localProofFilePath) {
