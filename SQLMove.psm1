@@ -1291,7 +1291,6 @@ function Export-DatabaseOperation {
     }
 }
 
-
 function Export-BacpacWithProgress {
     [CmdletBinding()]
     param(
