@@ -1174,7 +1174,7 @@ SKIP, NOREWIND, NOUNLOAD$compressionOption, STATS = 10
         
         # Create SQL connection
         Add-Type -AssemblyName System.Data
-        $connectionString = "Server=$ServerFQDN;Database=master;User Id=$Username;Password=$Password;Connection Timeout=30;Encrypt=True;TrustServerCertificate=False;"
+        $connectionString = "Server=$ServerFQDN;Database=master;User Id=$Username;Password=$Password;Connection Timeout=30;Encrypt=True;TrustServerCertificate=True;"
         $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
         
         try {
