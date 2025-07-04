@@ -262,7 +262,9 @@ function Test-RequiredFields {
     # Export-specific required fields
     if ($ExportAction) {
         $exportFields = @('SRC_server', 'SRC_SQL_Admin', 'SRC_SQL_Password')
-
+        if ($Row.Type -eq 'AzureIaaS') {
+            $exportFields += @('PS_User', 'PS_Password')
+        }
 
         foreach ($field in $exportFields) {
             if ([string]::IsNullOrEmpty($Row.$field)) {
@@ -274,8 +276,9 @@ function Test-RequiredFields {
     # Import-specific required fields
     if ($ImportAction) {
         $importFields = @('DST_server', 'DST_SQL_Admin', 'DST_SQL_Password')
-        
-
+        if ($Row.Type -eq 'AzureIaaS') {
+            $importFields += @('PS_User', 'PS_Password')
+        }
 
         foreach ($field in $importFields) {
             if ([string]::IsNullOrEmpty($Row.$field)) {
@@ -425,6 +428,65 @@ function Test-RemoteSqlServerDiskSpace {
         Write-StatusMessage $errorMessage -Type Error -Indent 3
         Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
         return $false
+    }
+}
+
+function Copy-FileToRemote {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServerFQDN,
+        [Parameter(Mandatory = $true)]
+        [string]$LocalPath,
+        [Parameter(Mandatory = $true)]
+        [string]$RemotePath,
+        [Parameter(Mandatory = $true)]
+        [string]$Username,
+        [Parameter(Mandatory = $true)]
+        [string]$Password,
+        [Parameter(Mandatory = $false)]
+        [string]$LogFile
+    )
+
+    try {
+        Write-OperationStatus "Copying file to remote server..." -Type Action -Indent 2 -LogFile $LogFile
+        Write-OperationStatus "Source: $LocalPath" -Type Info -Indent 3 -LogFile $LogFile
+        Write-OperationStatus "Destination: $RemotePath on $ServerFQDN" -Type Info -Indent 3 -LogFile $LogFile
+
+        $credential = New-Object System.Management.Automation.PSCredential($Username, (ConvertTo-SecureString $Password -AsPlainText -Force))
+        $psSession = New-PSSession -ComputerName $ServerFQDN -Credential $credential
+
+        # Ensure the remote directory exists
+        $remoteDir = Split-Path -Path $RemotePath -Parent
+        Invoke-Command -Session $psSession -ScriptBlock {
+            param($Path)
+            if (-not (Test-Path $Path)) {
+                New-Item -Path $Path -ItemType Directory -Force | Out-Null
+            }
+        } -ArgumentList $remoteDir
+
+        Copy-Item -ToSession $psSession -Path $LocalPath -Destination $RemotePath -Force
+
+        # Verify the copy
+        $remoteFileExists = Invoke-Command -Session $psSession -ScriptBlock { param($Path) Test-Path $Path } -ArgumentList $RemotePath
+        
+        if ($remoteFileExists) {
+            Write-OperationStatus "File copied to remote server successfully." -Type Success -Indent 2 -LogFile $LogFile
+            return $true
+        }
+        else {
+            Write-OperationStatus "File copy to remote server failed. File not found after copy." -Type Error -Indent 2 -LogFile $LogFile
+            return $false
+        }
+    }
+    catch {
+        Write-OperationStatus "Error copying file to remote: $($_.Exception.Message)" -Type Error -Indent 2 -LogFile $LogFile
+        return $false
+    }
+    finally {
+        if ($psSession) {
+            Remove-PSSession $psSession
+        }
     }
 }
 
@@ -660,6 +722,53 @@ function Test-SqlServerAccess {
     catch {
         Write-OperationStatus "Cannot connect to $Operation server '$ServerFQDN': $($_.Exception.Message)" -Type Error -Indent 3 -LogFile $LogFile
         return $false
+    }
+}
+
+function Copy-FileFromRemote {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServerFQDN,
+        [Parameter(Mandatory = $true)]
+        [string]$RemotePath,
+        [Parameter(Mandatory = $true)]
+        [string]$LocalPath,
+        [Parameter(Mandatory = $true)]
+        [string]$Username,
+        [Parameter(Mandatory = $true)]
+        [string]$Password,
+        [Parameter(Mandatory = $false)]
+        [string]$LogFile
+    )
+
+    try {
+        Write-OperationStatus "Copying file from remote server..." -Type Action -Indent 2 -LogFile $LogFile
+        Write-OperationStatus "Source: $RemotePath" -Type Info -Indent 3 -LogFile $LogFile
+        Write-OperationStatus "Destination: $LocalPath" -Type Info -Indent 3 -LogFile $LogFile
+
+        $credential = New-Object System.Management.Automation.PSCredential($Username, (ConvertTo-SecureString $Password -AsPlainText -Force))
+        $psSession = New-PSSession -ComputerName $ServerFQDN -Credential $credential
+
+        Copy-Item -FromSession $psSession -Path $RemotePath -Destination $LocalPath -Force
+
+        if (Test-Path $LocalPath) {
+            Write-OperationStatus "File copied successfully." -Type Success -Indent 2 -LogFile $LogFile
+            return $true
+        }
+        else {
+            Write-OperationStatus "File copy failed. Local file not found after copy." -Type Error -Indent 2 -LogFile $LogFile
+            return $false
+        }
+    }
+    catch {
+        Write-OperationStatus "Error copying file from remote: $($_.Exception.Message)" -Type Error -Indent 2 -LogFile $LogFile
+        return $false
+    }
+    finally {
+        if ($psSession) {
+            Remove-PSSession $psSession
+        }
     }
 }
 
@@ -1367,15 +1476,33 @@ function Export-DatabaseOperation {
             Write-StatusMessage "Failed to export database to local file" -Type Error -Indent 2
             return $false
         }
+
+        $uploadPath = $localBackupPath
+        if ($deploymentType -eq "AzureIaaS") {
+            $drive = $localBackupPath.Substring(0,1)
+            $folder = $localBackupPath.Substring(2)
+            $remotePathForCopy = "$($drive):\$($folder)"
+            $localTempPath = Join-Path $env:TEMP $backupFileName
+            $copySuccess = Copy-FileFromRemote -ServerFQDN $Row.SRC_server -RemotePath $remotePathForCopy -LocalPath $localTempPath -Username $Row.PS_User -Password $Row.PS_Password -LogFile $LogFile
+            if (-not $copySuccess) {
+                Write-StatusMessage "Failed to copy backup file from remote server." -Type Error -Indent 2
+                return $false
+            }
+            $uploadPath = $localTempPath
+        }
         
         # Upload to storage using the same filename
         $uploadFunction = if ($deploymentType -eq "AzureIaaS") { ${function:Upload-BakToStorage} } else { ${function:Upload-BacpacToStorage} }
-        $uploadSuccess = & $uploadFunction -FilePath $localBackupPath `
+        $uploadSuccess = & $uploadFunction -FilePath $uploadPath `
             -StorageAccount $Row.Storage_Account `
             -ContainerName $Row.Storage_Container `
             -StorageKey $Row.Storage_Access_Key `
             -BlobName $backupFileName `
             -LogFile $LogFile
+            
+        if ($deploymentType -eq "AzureIaaS" -and (Test-Path $uploadPath)) {
+            Remove-Item -Path $uploadPath -Force
+        }
             
         if (-not $uploadSuccess) {
             Write-StatusMessage "Failed to upload backup file to storage" -Type Error -Indent 2
@@ -2166,25 +2293,46 @@ function Import-DatabaseOperation {
             return $false
         }
 
-        # Use the exact same filename for local path
-        $localBackupPath = Join-Path -Path $Row.Local_Folder -ChildPath $blobName
-        
+        # Define local and remote paths. For IaaS, the final path is on the remote server.
+        # For other types, it's the same as the local path.
+        $localTempPath = Join-Path $env:TEMP $blobName
+        $remoteBackupPath = Join-Path -Path $Row.Local_Folder -ChildPath $blobName
+        $restoreSourcePath = if ($deploymentType -eq "AzureIaaS") { $remoteBackupPath } else { $localTempPath }
+
+        # Always download to the local machine first
         $downloadSuccess = Download-BackupFromStorage -StorageAccount $Row.Storage_Account `
             -ContainerName $Row.Storage_Container `
             -StorageKey $Row.Storage_Access_Key `
             -BlobName $blobName `
-            -LocalPath $localBackupPath `
+            -LocalPath $localTempPath `
             -LogFile $LogFile
-        
+            
         if (-not $downloadSuccess) {
             Write-StatusMessage "Failed to download backup file from storage" -Type Error -Indent 2
             return $false
         }
 
+        # If IaaS, copy the downloaded file to the destination server
+        if ($deploymentType -eq "AzureIaaS") {
+            $copySuccess = Copy-FileToRemote -ServerFQDN $dstServerFQDN `
+                -LocalPath $localTempPath `
+                -RemotePath $remoteBackupPath `
+                -Username $Row.PS_User `
+                -Password $Row.PS_Password `
+                -LogFile $LogFile
+            
+            if (-not $copySuccess) {
+                Write-StatusMessage "Failed to copy backup file to destination server" -Type Error -Indent 2
+                # Clean up local temp file before exiting
+                if (Test-Path $localTempPath) { Remove-Item $localTempPath -Force }
+                return $false
+            }
+        }
+
         # Import based on deployment type
         $importSuccess = switch ($deploymentType) {
             "AzureMI" {
-                Import-BacpacToSqlManagedInstance -BacpacSource $localBackupPath `
+                Import-BacpacToSqlManagedInstance -BacpacSource $restoreSourcePath `
                     -ServerFQDN $dstServerFQDN `
                     -DatabaseName $Row.Database_Name `
                     -Username $Row.DST_SQL_Admin `
@@ -2193,7 +2341,7 @@ function Import-DatabaseOperation {
                     -LogFile $LogFile
             }
             "AzureIaaS" {
-                Import-BakToSqlDatabase -BakSource $localBackupPath `
+                Import-BakToSqlDatabase -BakSource $restoreSourcePath `
                     -ServerFQDN $dstServerFQDN `
                     -DatabaseName $Row.Database_Name `
                     -Username $Row.DST_SQL_Admin `
@@ -2201,7 +2349,7 @@ function Import-DatabaseOperation {
                     -LogFile $LogFile
             }
             default {
-                Import-BacpacToSqlDatabase -BacpacSource $localBackupPath `
+                Import-BacpacToSqlDatabase -BacpacSource $restoreSourcePath `
                     -ServerFQDN $dstServerFQDN `
                     -DatabaseName $Row.Database_Name `
                     -Username $Row.DST_SQL_Admin `
@@ -2219,10 +2367,29 @@ function Import-DatabaseOperation {
         if ($importSuccess) {
             Write-StatusMessage "Import operation completed successfully in $importDurationFormatted" -Type Success -Indent 2
             Write-LogMessage -LogFile $LogFile -Message "Import operation duration: $importDurationFormatted" -Type Success
-            
-            if ([bool]::Parse($Row.Remove_Tempfile)) {
-                Remove-Item -Path $localBackupPath -Force
-                Write-StatusMessage "Cleaned up local file" -Type Info -Indent 2
+        }
+
+        # Cleanup temp files
+        if ([bool]::Parse($Row.Remove_Tempfile)) {
+            # Clean up local temp file
+            if (Test-Path $localTempPath) {
+                Remove-Item $localTempPath -Force
+                Write-OperationStatus "Cleaned up local temporary file." -Type Info -Indent 2 -LogFile $LogFile
+            }
+
+            # Clean up remote file for IaaS
+            if ($deploymentType -eq "AzureIaaS") {
+                Write-OperationStatus "Cleaning up remote file on $dstServerFQDN..." -Type Info -Indent 2 -LogFile $LogFile
+                try {
+                    $credential = New-Object System.Management.Automation.PSCredential($Row.PS_User, (ConvertTo-SecureString $Row.PS_Password -AsPlainText -Force))
+                    $psSession = New-PSSession -ComputerName $dstServerFQDN -Credential $credential
+                    Invoke-Command -Session $psSession -ScriptBlock { param($Path) Remove-Item -Path $Path -Force } -ArgumentList $remoteBackupPath
+                    Remove-PSSession $psSession
+                    Write-OperationStatus "Remote file cleaned up successfully." -Type Success -Indent 2 -LogFile $LogFile
+                } 
+                catch {
+                    Write-OperationStatus "Warning: Could not clean up remote file: $_" -Type Warning -Indent 2 -LogFile $LogFile
+                }
             }
         }
 
