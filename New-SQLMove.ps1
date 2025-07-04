@@ -91,8 +91,8 @@ Process {
         }
 
         # Calculate FQDNs
-        $srcServerFQDN = Get-ServerFQDN -ServerName $row.SRC_server
-        $dstServerFQDN = Get-ServerFQDN -ServerName $row.DST_server
+        $srcServerFQDN = Get-ServerFQDN -ServerName $row.SRC_server -DeploymentType $deploymentType
+        $dstServerFQDN = Get-ServerFQDN -ServerName $row.DST_server -DeploymentType $deploymentType
 
         Write-StatusMessage "Source Server: $($row.SRC_server) -> $srcServerFQDN" -Type Info -Indent 1
         Write-StatusMessage "Destination Server: $($row.DST_server) -> $dstServerFQDN" -Type Info -Indent 1
@@ -118,14 +118,14 @@ Process {
 
         # Check source server access if export is enabled
         if ($exportAction) {
-            if (-not (Test-SqlServerAccess -ServerFQDN $srcServerFQDN -DatabaseName $databaseName -Username $row.SRC_SQL_Admin -Password $row.SRC_SQL_Password -Operation "source" -LogFile $logFile)) {
+            if (-not (Test-SqlServerAccess -ServerFQDN $srcServerFQDN -DatabaseName $databaseName -Username $row.SRC_SQL_Admin -Password $row.SRC_SQL_Password -Operation "source" -LogFile $logFile -DeploymentType $deploymentType)) {
                 $preflightSuccess = $false
             }
         }
 
         # Check destination server access if import is enabled
         if ($importAction) {
-            if (-not (Test-SqlServerAccess -ServerFQDN $dstServerFQDN -DatabaseName $databaseName -Username $row.DST_SQL_Admin -Password $row.DST_SQL_Password -Operation "destination" -LogFile $logFile)) {
+            if (-not (Test-SqlServerAccess -ServerFQDN $dstServerFQDN -DatabaseName $databaseName -Username $row.DST_SQL_Admin -Password $row.DST_SQL_Password -Operation "destination" -LogFile $logFile -DeploymentType $deploymentType)) {
                 $preflightSuccess = $false
             }
         }

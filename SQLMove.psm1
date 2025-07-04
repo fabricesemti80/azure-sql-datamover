@@ -166,9 +166,17 @@ function Get-ServerFQDN {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$ServerName
+        [string]$ServerName,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$DeploymentType = "AzurePaaS" # Default to AzurePaaS for backward compatibility
     )
     
+    # For AzureIaaS, return the server name as-is
+    if ($DeploymentType -eq "AzureIaaS") {
+        return $ServerName
+    }
+
     # If already ends with .database.windows.net, return as-is
     if ($ServerName.EndsWith(".database.windows.net", [System.StringComparison]::OrdinalIgnoreCase)) {
         return $ServerName
@@ -254,6 +262,8 @@ function Test-RequiredFields {
     # Export-specific required fields
     if ($ExportAction) {
         $exportFields = @('SRC_server', 'SRC_SQL_Admin', 'SRC_SQL_Password')
+
+
         foreach ($field in $exportFields) {
             if ([string]::IsNullOrEmpty($Row.$field)) {
                 $missingFields += $field
@@ -264,6 +274,9 @@ function Test-RequiredFields {
     # Import-specific required fields
     if ($ImportAction) {
         $importFields = @('DST_server', 'DST_SQL_Admin', 'DST_SQL_Password')
+        
+
+
         foreach ($field in $importFields) {
             if ([string]::IsNullOrEmpty($Row.$field)) {
                 $missingFields += $field
@@ -329,7 +342,91 @@ function Test-DiskSpace {
     }
 }
 
-
+function Test-RemoteSqlServerDiskSpace {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServerFQDN,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$Username,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$Password,
+        
+        [Parameter(Mandatory = $true)]
+        [long]$RequiredSpaceGB,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$LocalFolder,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$LogFile
+    )
+    
+    # Extract drive letter from Local_Folder path
+    $driveLetter = Split-Path -Path $LocalFolder -Qualifier
+    if ($driveLetter) {
+        $driveLetter = $driveLetter.Replace(":", "")  # Remove colon for xp_fixeddrives
+    }
+    else {
+        $driveLetter = "C"  # Default to C drive if can't determine
+    }
+    
+    Write-StatusMessage "Testing disk space on drive '$driveLetter' of remote server '$ServerFQDN'..." -Type Info -Indent 2
+    Write-LogMessage -LogFile $LogFile -Message "Testing disk space on drive '$driveLetter' of remote server '$ServerFQDN' for path '$LocalFolder'" -Type Info
+    
+    try {
+        $connection = New-SqlConnection -ServerFQDN $ServerFQDN -Database "master" -Username $Username -Password $Password -TrustServerCertificate $true
+        $connection.Open()
+        
+        $command = $connection.CreateCommand()
+        $command.CommandText = "EXEC xp_fixeddrives"
+        $reader = $command.ExecuteReader()
+        
+        $targetDriveFreeSpaceMB = $null
+        while ($reader.Read()) {
+            $currentDrive = $reader.GetString(0)
+            $freeSpaceMB = $reader.GetInt32(1)
+            
+            if ($currentDrive -eq $driveLetter) {
+                $targetDriveFreeSpaceMB = $freeSpaceMB
+                break
+            }
+        }
+        $reader.Close()
+        $connection.Close()
+        
+        if ($targetDriveFreeSpaceMB -eq $null) {
+            $errorMessage = "Drive '$driveLetter' not found on remote server '$ServerFQDN'"
+            Write-StatusMessage $errorMessage -Type Error -Indent 3
+            Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+            return $false
+        }
+        
+        $freeSpaceGB = [math]::Round($targetDriveFreeSpaceMB / 1024, 2)
+        $message = "Available space on drive '$driveLetter': $freeSpaceGB GB, Required: $RequiredSpaceGB GB"
+        Write-StatusMessage $message -Type Info -Indent 3
+        Write-LogMessage -LogFile $LogFile -Message $message -Type Info
+        
+        if ($freeSpaceGB -lt $RequiredSpaceGB) {
+            $errorMessage = "Insufficient disk space on drive '$driveLetter' of server '$ServerFQDN'. Available: $freeSpaceGB GB, Required: $RequiredSpaceGB GB"
+            Write-StatusMessage $errorMessage -Type Error -Indent 3
+            Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+            return $false
+        }
+        
+        Write-StatusMessage "Remote disk space check passed on drive '$driveLetter' of '$ServerFQDN'" -Type Success -Indent 3
+        Write-LogMessage -LogFile $LogFile -Message "Remote disk space check passed on drive '$driveLetter' of '$ServerFQDN'" -Type Success
+        return $true
+    }
+    catch {
+        $errorMessage = "Error checking remote disk space on '$ServerFQDN': $($_.Exception.Message)"
+        Write-StatusMessage $errorMessage -Type Error -Indent 3
+        Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
+        return $false
+    }
+}
 
 function Test-StorageAccess {
     [CmdletBinding()]
@@ -390,10 +487,11 @@ function New-SqlConnection {
         [string]$Database = "master",
         [string]$Username,
         [string]$Password,
-        [int]$Timeout = 30
+        [int]$Timeout = 30,
+        [bool]$TrustServerCertificate = $false # New parameter for trusting certificate
     )
     
-    $connectionString = "Server=$ServerFQDN;Database=$Database;User Id=$Username;Password=$Password;Connection Timeout=$Timeout;Encrypt=True;TrustServerCertificate=False;"
+    $connectionString = "Server=$ServerFQDN;Database=$Database;User Id=$Username;Password=$Password;Connection Timeout=$Timeout;Encrypt=True;TrustServerCertificate=$TrustServerCertificate;"
     $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
     return $connection
 }
@@ -537,13 +635,16 @@ function Test-SqlServerAccess {
         [string]$Username,
         [string]$Password,
         [string]$Operation,
-        [string]$LogFile
+        [string]$LogFile,
+        [string]$DeploymentType # Added DeploymentType
     )
     
     Write-OperationStatus "Testing $Operation SQL Server access: $ServerFQDN" -Type Info -Indent 2 -LogFile $LogFile
     
     try {
-        $connection = New-SqlConnection -ServerFQDN $ServerFQDN -Username $Username -Password $Password
+        $trustCert = ($DeploymentType -eq "AzureIaaS")
+        
+        $connection = New-SqlConnection -ServerFQDN $ServerFQDN -Username $Username -Password $Password -TrustServerCertificate $trustCert
         $connection.Open()
         
         $command = $connection.CreateCommand()
@@ -1334,10 +1435,12 @@ function Export-BakWithProgress {
         [string]$Username,
         [string]$Password,
         [string]$OutputPath,
-        [string]$LogFile
+        [string]$LogFile,
+        [string]$DeploymentType # Added DeploymentType
     )
     
-    $connection = New-SqlConnection -ServerFQDN $ServerFQDN -Database "master" -Username $Username -Password $Password
+    $trustCert = ($DeploymentType -eq "AzureIaaS")
+    $connection = New-SqlConnection -ServerFQDN $ServerFQDN -Database "master" -Username $Username -Password $Password -TrustServerCertificate $trustCert
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     
     try {
@@ -1441,14 +1544,16 @@ function Import-BacpacToSqlManagedInstance {
         [string]$Username,
         [string]$Password,
         [string]$SqlPackagePath,
-        [string]$LogFile
+        [string]$LogFile,
+        [string]$DeploymentType # Added DeploymentType
     )
     
     $startTime = Get-Date
     
     try {
+        $trustCert = ($DeploymentType -eq "AzureIaaS")
         # First, check and drop existing database
-        $connection = New-SqlConnection -ServerFQDN $ServerFQDN -Username $Username -Password $Password
+        $connection = New-SqlConnection -ServerFQDN $ServerFQDN -Username $Username -Password $Password -TrustServerCertificate $trustCert
         $connection.Open()
 
         Write-OperationStatus "Checking for existing database..." -Type Info -Indent 3 -LogFile $LogFile
@@ -1609,7 +1714,8 @@ function Import-BakToSqlDatabase {
 
         # Create SQL connection
         Add-Type -AssemblyName System.Data
-        $connectionString = "Server=$ServerFQDN;Database=master;User Id=$Username;Password=$Password;Connection Timeout=30;Encrypt=True;TrustServerCertificate=False;"
+        $trustCert = ($DeploymentType -eq "AzureIaaS")
+        $connectionString = "Server=$ServerFQDN;Database=master;User Id=$Username;Password=$Password;Connection Timeout=30;Encrypt=True;TrustServerCertificate=$trustCert;"
         $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
         
         try {
