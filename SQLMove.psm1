@@ -1311,12 +1311,12 @@ function Export-DatabaseOperation {
     try {
         Write-LogMessage -LogFile $LogFile -Message "Starting export database operation" -Type Action
         
-        $srcServerFQDN = Get-ServerFQDN -ServerName $Row.SRC_server
         $deploymentType = if ([string]::IsNullOrEmpty($Row.Type)) { "AzurePaaS" } else { $Row.Type }
+        $srcServerFQDN = Get-ServerFQDN -ServerName $Row.SRC_server -DeploymentType $deploymentType
         
         # Generate backup file path from components
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $extension = ".bacpac"  # Default to .bacpac for Azure SQL
+        $extension = if ($deploymentType -eq "AzureIaaS") { ".bak" } else { ".bacpac" }
         $backupFileName = "$($Row.Operation_ID)_$($Row.Database_Name)_${timestamp}${extension}"
         $localBackupPath = Join-Path -Path $Row.Local_Folder -ChildPath $backupFileName
         
@@ -1344,6 +1344,14 @@ function Export-DatabaseOperation {
                     -SqlPackagePath $SqlPackagePath `
                     -LogFile $LogFile
             }
+            "AzureIaaS" {
+                Export-SqlDatabaseToBak -ServerFQDN $srcServerFQDN `
+                    -DatabaseName $Row.Database_Name `
+                    -Username $Row.SRC_SQL_Admin `
+                    -Password $Row.SRC_SQL_Password `
+                    -OutputPath $localBackupPath `
+                    -LogFile $LogFile
+            }
             default {
                 Export-SqlDatabaseToBacpac -ServerFQDN $srcServerFQDN `
                     -DatabaseName $Row.Database_Name `
@@ -1361,7 +1369,8 @@ function Export-DatabaseOperation {
         }
         
         # Upload to storage using the same filename
-        $uploadSuccess = Upload-BacpacToStorage -FilePath $localBackupPath `
+        $uploadFunction = if ($deploymentType -eq "AzureIaaS") { ${function:Upload-BakToStorage} } else { ${function:Upload-BacpacToStorage} }
+        $uploadSuccess = & $uploadFunction -FilePath $localBackupPath `
             -StorageAccount $Row.Storage_Account `
             -ContainerName $Row.Storage_Container `
             -StorageKey $Row.Storage_Access_Key `
@@ -2141,8 +2150,8 @@ function Import-DatabaseOperation {
     try {
         Write-LogMessage -LogFile $LogFile -Message "Starting import database operation" -Type Action
         
-        $dstServerFQDN = Get-ServerFQDN -ServerName $Row.DST_server
         $deploymentType = if ([string]::IsNullOrEmpty($Row.Type)) { "AzurePaaS" } else { $Row.Type }
+        $dstServerFQDN = Get-ServerFQDN -ServerName $Row.DST_server -DeploymentType $deploymentType
         
         # Find latest backup in storage
         $blobName = Find-LatestBackupBlob -StorageAccount $Row.Storage_Account `
