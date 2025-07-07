@@ -1802,18 +1802,16 @@ function Import-BakToSqlDatabase {
 
         # Get file size for progress context
         $fileSizeMB = 0
-        if (Test-Path $BakSource) {
-            $fileInfo = Get-Item $BakSource
+        try {
+            $fileInfo = Get-Item $BakSource -ErrorAction Stop
             $fileSizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
             $sizeMessage = "Restore source size: $fileSizeMB MB"
             Write-StatusMessage $sizeMessage -Type Info -Indent 4
             Write-LogMessage -LogFile $LogFile -Message $sizeMessage -Type Info
         }
-        else {
-            $errorMessage = "BAK file not found: $BakSource"
-            Write-StatusMessage $errorMessage -Type Error -Indent 4
-            Write-LogMessage -LogFile $LogFile -Message $errorMessage -Type Error
-            return $false
+        catch {
+            # This will fail if the file is on the remote server, which is expected for IaaS.
+            Write-LogMessage -LogFile $LogFile -Message "Could not get local file size for $BakSource. This is expected for IaaS." -Type Info
         }
 
         # Check if this is Azure SQL Managed Instance (contains specific patterns in FQDN)
