@@ -1114,6 +1114,68 @@ function Get-BackupFileInfo {
     }
 }
 
+function Get-SqlServerDefaultPaths {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServerFQDN,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$Username,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$Password,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$LogFile,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$DeploymentType # Added DeploymentType
+    )
+    
+    Write-OperationStatus "Querying SQL Server for default data and log paths..." -Type Info -Indent 4 -LogFile $LogFile
+    
+    $trustCert = ($DeploymentType -eq "AzureIaaS")
+    $connection = New-SqlConnection -ServerFQDN $ServerFQDN -Database "master" -Username $Username -Password $Password -TrustServerCertificate $trustCert
+    
+    try {
+        $connection.Open()
+        
+        $command = $connection.CreateCommand()
+        $command.CommandText = @"
+SELECT 
+    SERVERPROPERTY('InstanceDefaultDataPath') AS DefaultDataPath,
+    SERVERPROPERTY('InstanceDefaultLogPath') AS DefaultLogPath;
+"@
+        $reader = $command.ExecuteReader()
+        
+        $defaultPaths = @{
+            DefaultDataPath = $null
+            DefaultLogPath  = $null
+        }
+        
+        if ($reader.Read()) {
+            $defaultPaths.DefaultDataPath = $reader["DefaultDataPath"]
+            $defaultPaths.DefaultLogPath = $reader["DefaultLogPath"]
+        }
+        $reader.Close()
+        
+        Write-OperationStatus "Default Data Path: $($defaultPaths.DefaultDataPath)" -Type Info -Indent 5 -LogFile $LogFile
+        Write-OperationStatus "Default Log Path: $($defaultPaths.DefaultLogPath)" -Type Info -Indent 5 -LogFile $LogFile
+        
+        return $defaultPaths
+    }
+    catch {
+        Write-OperationStatus "Error querying default SQL paths: $($_.Exception.Message)" -Type Error -Indent 4 -LogFile $LogFile
+        return $null
+    }
+    finally {
+        if ($connection -and $connection.State -eq 'Open') {
+            $connection.Close()
+        }
+    }
+}
+
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- #
 #                                                                                           Export functions                                                                                           #
@@ -1479,7 +1541,7 @@ function Export-DatabaseOperation {
 
         $uploadPath = $localBackupPath
         if ($deploymentType -eq "AzureIaaS") {
-            $drive = $localBackupPath.Substring(0,1)
+            $drive = $localBackupPath.Substring(0, 1)
             $folder = $localBackupPath.Substring(2)
             $remotePathForCopy = "$($drive):\$($folder)"
             $localTempPath = Join-Path $env:TEMP $backupFileName
@@ -2025,6 +2087,12 @@ FROM URL = N'$bakUrl'
                     return $false
                 }
 
+                # Get default data and log paths from the destination SQL Server
+                $defaultPaths = Get-SqlServerDefaultPaths -ServerFQDN $ServerFQDN -Username $Username -Password $Password -LogFile $LogFile -DeploymentType $DeploymentType
+                if (-not $defaultPaths) {
+                    return $false # Error message already logged by Get-SqlServerDefaultPaths
+                }
+
                 # Build MOVE options for data and log files
                 $moveOptions = @()
                 foreach ($row in $fileListTable.Rows) {
@@ -2033,23 +2101,21 @@ FROM URL = N'$bakUrl'
                     
                     if ($fileType -eq "D") {
                         # Data file
-                        if ($DataFileLocation) {
-                            $newPath = Join-Path $DataFileLocation "$DatabaseName.mdf"
+                        $newPath = if ($DataFileLocation) {
+                            Join-Path $DataFileLocation "$DatabaseName.mdf"
                         }
                         else {
-                            # Use default SQL Server data directory
-                            $newPath = "$DatabaseName.mdf"
+                            Join-Path $defaultPaths.DefaultDataPath "$DatabaseName.mdf"
                         }
                         $moveOptions += "MOVE N'$logicalName' TO N'$newPath'"
                     }
                     elseif ($fileType -eq "L") {
                         # Log file
-                        if ($LogFileLocation) {
-                            $newPath = Join-Path $LogFileLocation "$DatabaseName.ldf"
+                        $newPath = if ($LogFileLocation) {
+                            Join-Path $LogFileLocation "$DatabaseName.ldf"
                         }
                         else {
-                            # Use default SQL Server log directory
-                            $newPath = "$DatabaseName.ldf"
+                            Join-Path $defaultPaths.DefaultLogPath "$DatabaseName.ldf"
                         }
                         $moveOptions += "MOVE N'$logicalName' TO N'$newPath'"
                     }
